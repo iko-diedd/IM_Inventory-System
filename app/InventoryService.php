@@ -7,10 +7,13 @@ final class InventoryService
     {
     }
 
-    public function createPurchase(int $supplierId, array $lines, string $actorId): int
+    public function createPurchase(int $supplierId, array $lines, string $actorId, float $taxRate = 0.0): int
     {
         if ($lines === [] || count($lines) > 50) {
             throw new InvalidArgumentException('A purchase order must contain between one and 50 product lines.');
+        }
+        if (!is_finite($taxRate) || $taxRate < 0 || $taxRate > 100) {
+            throw new InvalidArgumentException('The purchase tax rate must be between 0 and 100 percent.');
         }
         $validatedLines = [];
         $seenProducts = [];
@@ -38,7 +41,7 @@ final class InventoryService
             ];
         }
 
-        return $this->transaction(function () use ($supplierId, $validatedLines, $actorId): int {
+        return $this->transaction(function () use ($supplierId, $validatedLines, $actorId, $taxRate): int {
             $supplier = $this->db->prepare('SELECT supplier_id FROM suppliers WHERE supplier_id = :id AND is_active');
             $supplier->execute(['id' => $supplierId]);
             if (!$supplier->fetchColumn()) {
@@ -57,16 +60,23 @@ final class InventoryService
                 }
             }
 
+            $subtotal = round($total, 2);
+            $tax = round($subtotal * $taxRate / 100, 2);
+            $total = round($subtotal + $tax, 2);
+            if (!is_finite($total) || $total > 999999999999.99) {
+                throw new InvalidArgumentException('Purchase order total exceeds the supported monetary range.');
+            }
             $number = 'PO-' . gmdate('Ymd-His') . '-' . strtoupper(bin2hex(random_bytes(3)));
             $insert = $this->db->prepare(
-                'INSERT INTO purchases (purchase_number, supplier_id, created_by, total_amount)
-                 VALUES (:number, :supplier, :actor, :total) RETURNING purchase_id'
+                'INSERT INTO purchases (purchase_number, supplier_id, created_by, total_amount, tax_amount)
+                 VALUES (:number, :supplier, :actor, :total, :tax) RETURNING purchase_id'
             );
             $insert->execute([
                 'number' => $number,
                 'supplier' => $supplierId,
                 'actor' => $actorId,
-                'total' => round($total, 2),
+                'total' => $total,
+                'tax' => $tax,
             ]);
             $purchaseId = (int) $insert->fetchColumn();
             $item = $this->db->prepare(
@@ -94,7 +104,10 @@ final class InventoryService
             $this->audit($actorId, 'purchase.created', 'purchase', (string) $purchaseId, [
                 'purchase_number' => $number,
                 'line_count' => count($validatedLines),
-                'total' => round($total, 2),
+                'subtotal' => $subtotal,
+                'tax_rate' => $taxRate,
+                'tax' => $tax,
+                'total' => $total,
             ]);
 
             return $purchaseId;
@@ -207,12 +220,13 @@ final class InventoryService
         });
     }
 
-    public function checkout(array $items, float $discount, float $tax, string $paymentMethod, string $requestKey, string $actorId): int
+    public function checkout(array $items, float $discountRate, float $taxRate, string $paymentMethod, string $requestKey, string $actorId): int
     {
         $this->validateRequestKey($requestKey);
         if (!in_array($paymentMethod, ['cash', 'card', 'bank_transfer', 'other'], true)
-            || !is_finite($discount) || !is_finite($tax) || $discount < 0 || $tax < 0) {
-            throw new InvalidArgumentException('Review the payment method, discount, and tax.');
+            || !is_finite($discountRate) || $discountRate < 0 || $discountRate > 100
+            || !is_finite($taxRate) || $taxRate < 0 || $taxRate > 100) {
+            throw new InvalidArgumentException('Review the payment method, discount percentage, and tax.');
         }
         $quantities = [];
         foreach ($items as $item) {
@@ -234,7 +248,7 @@ final class InventoryService
         }
         ksort($quantities);
 
-        return $this->transaction(function () use ($quantities, $discount, $tax, $paymentMethod, $requestKey, $actorId): int {
+        return $this->transaction(function () use ($quantities, $discountRate, $taxRate, $paymentMethod, $requestKey, $actorId): int {
             $duplicate = $this->db->prepare('SELECT sale_id FROM sales WHERE idempotency_key = :key');
             $duplicate->execute(['key' => $requestKey]);
             $existing = $duplicate->fetchColumn();
@@ -269,8 +283,10 @@ final class InventoryService
             if (!is_finite($subtotal) || $subtotal > 999999999999.99) {
                 throw new InvalidArgumentException('Sale subtotal exceeds the supported monetary range.');
             }
-            if ($discount > $subtotal) {
-                throw new InvalidArgumentException('Discount cannot exceed the sale subtotal.');
+            $discount = self::calculateDiscountAmount($subtotal, $discountRate);
+            $tax = round(($subtotal - $discount) * $taxRate / 100, 2);
+            if (!is_finite($discount) || !is_finite($tax) || $subtotal - $discount + $tax > 999999999999.99) {
+                throw new InvalidArgumentException('Sale total exceeds the supported monetary range.');
             }
             $remainingDiscount = round($discount, 2);
             foreach ($locked as $index => &$line) {
@@ -285,8 +301,9 @@ final class InventoryService
 
             $receiptNumber = 'RC-' . gmdate('Ymd-His') . '-' . strtoupper(bin2hex(random_bytes(3)));
             $sale = $this->db->prepare(
-                'INSERT INTO sales (receipt_number, idempotency_key, cashier_id, subtotal, discount, tax, total, payment_method)
-                 VALUES (:receipt, :key, :cashier, :subtotal, :discount, :tax, :total, :payment)
+                'INSERT INTO sales
+                    (receipt_number, idempotency_key, cashier_id, subtotal, discount, discount_rate, tax, total, payment_method)
+                 VALUES (:receipt, :key, :cashier, :subtotal, :discount, :discount_rate, :tax, :total, :payment)
                  ON CONFLICT (idempotency_key) DO NOTHING
                  RETURNING sale_id'
             );
@@ -296,6 +313,7 @@ final class InventoryService
                 'cashier' => $actorId,
                 'subtotal' => $subtotal,
                 'discount' => round($discount, 2),
+                'discount_rate' => round($discountRate, 2),
                 'tax' => round($tax, 2),
                 'total' => round($subtotal - $discount + $tax, 2),
                 'payment' => $paymentMethod,
@@ -343,11 +361,23 @@ final class InventoryService
             }
             $this->audit($actorId, 'sale.completed', 'sale', (string) $saleId, [
                 'receipt_number' => $receiptNumber,
+                'discount_rate' => round($discountRate, 2),
+                'discount' => round($discount, 2),
                 'total' => round($subtotal - $discount + $tax, 2),
             ]);
 
             return $saleId;
         });
+    }
+
+    public static function calculateDiscountAmount(float $eligibleSubtotal, float $discountRate): float
+    {
+        if (!is_finite($eligibleSubtotal) || $eligibleSubtotal < 0
+            || !is_finite($discountRate) || $discountRate < 0 || $discountRate > 100) {
+            throw new InvalidArgumentException('Subtotal and discount percentage must be valid.');
+        }
+
+        return round($eligibleSubtotal * $discountRate / 100, 2);
     }
 
     public function adjustStock(int $productId, int $countedStock, string $reason, string $actorId): void
@@ -391,6 +421,69 @@ final class InventoryService
                 'reason' => trim($reason),
             ]);
         });
+    }
+
+    /** Suggests quantities that restore stock to the minimum while considering open purchase orders. */
+    public function reorderSuggestions(): array
+    {
+        return $this->db->query(
+            "SELECT p.product_id, p.sku, p.name, p.stock_quantity, p.minimum_stock,
+                    GREATEST(p.minimum_stock - p.stock_quantity - COALESCE(open_orders.quantity, 0), 0) AS suggested_quantity,
+                    supplier.supplier_id, supplier.supplier_name,
+                    COALESCE(supplier.last_unit_cost, p.average_cost) AS unit_cost
+             FROM products p
+             LEFT JOIN LATERAL (
+                 SELECT SUM(pi.ordered_quantity - pi.received_quantity) AS quantity
+                 FROM purchase_items pi
+                 JOIN purchases pu USING (purchase_id)
+                 WHERE pi.product_id = p.product_id AND pu.status IN ('ordered', 'partially_received')
+             ) open_orders ON true
+             LEFT JOIN LATERAL (
+                 SELECT s.supplier_id, s.name AS supplier_name, sp.last_unit_cost
+                 FROM supplier_products sp
+                 JOIN suppliers s USING (supplier_id)
+                 WHERE sp.product_id = p.product_id AND s.is_active
+                 ORDER BY sp.last_unit_cost NULLS LAST, s.name
+                 LIMIT 1
+             ) supplier ON true
+             WHERE p.is_active AND p.stock_quantity <= p.minimum_stock
+             ORDER BY p.name"
+        )->fetchAll();
+    }
+
+    /** Creates one purchase order per supplier for uncovered low-stock products. */
+    public function autoReorder(string $actorId, float $taxRate = 0.0): array
+    {
+        $bySupplier = [];
+        $skipped = 0;
+        foreach ($this->reorderSuggestions() as $row) {
+            $quantity = (int) $row['suggested_quantity'];
+            if ($quantity < 1) {
+                continue;
+            }
+            if ($row['supplier_id'] === null) {
+                $skipped++;
+                continue;
+            }
+            $bySupplier[(int) $row['supplier_id']][] = [
+                'product_id' => (int) $row['product_id'],
+                'quantity' => $quantity,
+                'unit_cost' => (float) $row['unit_cost'],
+            ];
+        }
+
+        $orders = 0;
+        $items = 0;
+        foreach ($bySupplier as $supplierId => $lines) {
+            $purchaseId = $this->createPurchase($supplierId, $lines, $actorId, $taxRate);
+            $this->audit($actorId, 'inventory.auto_reorder', 'purchase', (string) $purchaseId, [
+                'line_count' => count($lines),
+            ]);
+            $orders++;
+            $items += count($lines);
+        }
+
+        return ['orders' => $orders, 'items' => $items, 'skipped' => $skipped];
     }
 
     public function requestReturn(

@@ -15,6 +15,9 @@ $authNotice = (string) ($_SESSION['auth_notice'] ?? '');
 unset($_SESSION['auth_notice']);
 $user = null;
 $db = null;
+$notifications = [];
+$notificationUnreadCount = 0;
+$notificationReadsReady = false;
 
 try {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -37,6 +40,51 @@ try {
         $service = new InventoryService($db);
 
         switch ($action) {
+            case 'notification_mark_read':
+                require_notification_reads($db);
+                $notificationKey = required_post('notification_key', 300);
+                $activeNotifications = notification_rows($db, $user, false, null);
+                $selectedNotification = null;
+                foreach ($activeNotifications as $notification) {
+                    if (hash_equals((string) $notification['notification_key'], $notificationKey)) {
+                        $selectedNotification = $notification;
+                        break;
+                    }
+                }
+                if ($selectedNotification === null) {
+                    throw new RuntimeException('This notification is no longer available.');
+                }
+                $db->prepare(
+                    'INSERT INTO app_notification_reads (user_id, notification_key)
+                     VALUES (:user, :notification)
+                     ON CONFLICT (user_id, notification_key) DO NOTHING'
+                )->execute(['user' => $user['id'], 'notification' => $notificationKey]);
+                redirect((string) $selectedNotification['destination_page']);
+
+            case 'notifications_mark_all':
+                require_notification_reads($db);
+                $unreadNotifications = notification_rows($db, $user, true, null, true);
+                if ($unreadNotifications !== []) {
+                    database_transaction($db, function () use ($db, $user, $unreadNotifications): void {
+                        $insertRead = $db->prepare(
+                            'INSERT INTO app_notification_reads (user_id, notification_key)
+                             VALUES (:user, :notification)
+                             ON CONFLICT (user_id, notification_key) DO NOTHING'
+                        );
+                        foreach ($unreadNotifications as $notification) {
+                            $insertRead->execute([
+                                'user' => $user['id'],
+                                'notification' => $notification['notification_key'],
+                            ]);
+                        }
+                    });
+                }
+                $page = preg_match('/^[a-z_]{1,30}$/', (string) ($_POST['return_page'] ?? ''))
+                    ? (string) $_POST['return_page']
+                    : 'dashboard';
+                $notice = 'Current notifications marked as read.';
+                break;
+
             case 'product_create':
                 require_role(['administrator', 'manager', 'inventory_staff']);
                 database_transaction($db, function () use ($db, $user): int {
@@ -288,6 +336,7 @@ try {
 
             case 'purchase_create':
                 require_role(['administrator', 'manager', 'inventory_staff']);
+                require_tax_configuration($db);
                 $productIds = $_POST['product_id'] ?? null;
                 $quantities = $_POST['quantity'] ?? null;
                 $unitCosts = $_POST['unit_cost'] ?? null;
@@ -312,8 +361,25 @@ try {
                         'unit_cost' => (float) $rawCost,
                     ];
                 }
-                $service->createPurchase(post_int('supplier_id', 1), $lines, $user['id']);
+                $service->createPurchase(
+                    post_int('supplier_id', 1),
+                    $lines,
+                    $user['id'],
+                    current_tax_rate($db)
+                );
                 $notice = 'Purchase order created.';
+                $page = 'purchases';
+                break;
+
+            case 'auto_reorder':
+                require_role(['administrator', 'manager', 'inventory_staff']);
+                require_tax_configuration($db);
+                $result = $service->autoReorder($user['id'], current_tax_rate($db));
+                $notice = $result['orders'] > 0
+                    ? 'Created ' . $result['orders'] . ' purchase order(s) covering ' . $result['items'] . ' low-stock product(s).'
+                        . ($result['skipped'] > 0 ? ' ' . $result['skipped'] . ' product(s) were skipped because no supplier is set up.' : '')
+                    : 'Nothing to order automatically.'
+                        . ($result['skipped'] > 0 ? ' ' . $result['skipped'] . ' low-stock product(s) have no supplier set up.' : '');
                 $page = 'purchases';
                 break;
 
@@ -332,14 +398,16 @@ try {
 
             case 'sale_checkout':
                 require_role(['administrator', 'manager', 'cashier']);
+                require_tax_configuration($db);
+                require_discount_percentage($db);
                 $items = json_decode((string) ($_POST['cart'] ?? ''), true, 512, JSON_THROW_ON_ERROR);
                 if (!is_array($items)) {
                     throw new InvalidArgumentException('Cart data is invalid.');
                 }
                 $saleId = $service->checkout(
                     $items,
-                    post_money('discount'),
-                    post_money('tax'),
+                    post_percentage('discount_rate'),
+                    current_tax_rate($db),
                     (string) ($_POST['payment_method'] ?? ''),
                     (string) ($_POST['request_key'] ?? ''),
                     $user['id']
@@ -347,6 +415,30 @@ try {
                 $notice = 'Sale completed successfully.';
                 $page = 'receipt';
                 $_GET['id'] = (string) $saleId;
+                break;
+
+            case 'tax_rate_update':
+                require_role(['administrator', 'manager']);
+                require_tax_configuration($db);
+                $taxRate = post_money('tax_rate');
+                if ($taxRate > 100) {
+                    throw new InvalidArgumentException('Tax rate must be between 0 and 100 percent.');
+                }
+                database_transaction($db, function () use ($db, $user, $taxRate): void {
+                    $db->prepare(
+                        "INSERT INTO app_settings (setting_key, setting_value, updated_by, updated_at)
+                         VALUES ('tax_rate', :rate, :actor, now())
+                         ON CONFLICT (setting_key) DO UPDATE
+                         SET setting_value = EXCLUDED.setting_value,
+                             updated_by = EXCLUDED.updated_by,
+                             updated_at = now()"
+                    )->execute(['rate' => $taxRate, 'actor' => $user['id']]);
+                    audit_action($db, $user['id'], 'settings.tax_rate_updated', 'setting', 'tax_rate', [
+                        'tax_rate' => $taxRate,
+                    ]);
+                });
+                $notice = 'Tax rate updated. It will be applied to new purchase orders and sales.';
+                $page = 'sales';
                 break;
 
             case 'stock_adjust':
@@ -386,6 +478,7 @@ try {
             case 'profile_create':
                 require_role(['administrator']);
                 require_user_management_migration($db);
+                require_user_profile_extensions($db);
                 $name = required_post('full_name', 150);
                 $email = valid_optional_email('email');
                 if ($email === null) {
@@ -405,10 +498,18 @@ try {
                     throw new RuntimeException('Supabase Auth created an account without returning a valid user ID.');
                 }
                 try {
-                    database_transaction($db, function () use ($db, $user, $target, $name, $email, $role): void {
+                    $gender = valid_profile_gender();
+                    $hireDate = optional_post_date('hire_date');
+                    $emergencyName = optional_post('emergency_contact_name', 150);
+                    $emergencyPhone = optional_post('emergency_contact_phone', 40);
+                    database_transaction($db, function () use ($db, $user, $target, $name, $email, $role, $gender, $hireDate, $emergencyName, $emergencyPhone): void {
                         $db->prepare(
-                            'INSERT INTO app_profiles (user_id, email, full_name, address, birth_date, phone, role)
-                             VALUES (:id, :email, :name, :address, :birth_date, :phone, CAST(:role AS app_role))'
+                            'INSERT INTO app_profiles
+                                (user_id, email, full_name, address, birth_date, phone, role, gender, hire_date,
+                                 emergency_contact_name, emergency_contact_phone)
+                             VALUES
+                                (:id, :email, :name, :address, :birth_date, :phone, CAST(:role AS app_role),
+                                 :gender, :hire_date, :emergency_name, :emergency_phone)'
                         )->execute([
                             'id' => $target,
                             'email' => $email,
@@ -417,6 +518,10 @@ try {
                             'birth_date' => optional_post_date('birth_date'),
                             'phone' => optional_post('phone', 40),
                             'role' => $role,
+                            'gender' => $gender,
+                            'hire_date' => $hireDate,
+                            'emergency_name' => $emergencyName,
+                            'emergency_phone' => $emergencyPhone,
                         ]);
                         audit_action($db, $user['id'], 'profile.created', 'profile', $target, [
                             'full_name' => $name,
@@ -444,6 +549,7 @@ try {
             case 'profile_update':
                 require_role(['administrator']);
                 require_user_management_migration($db);
+                require_user_profile_extensions($db);
                 $target = (string) ($_POST['user_id'] ?? '');
                 if (!preg_match('/^[0-9a-f-]{36}$/i', $target)) {
                     throw new InvalidArgumentException('Select a valid user profile.');
@@ -464,7 +570,11 @@ try {
                 if (!is_string($password) || ($password !== '' && (strlen($password) < 12 || strlen($password) > 72))) {
                     throw new InvalidArgumentException('A new password must be between 12 and 72 characters.');
                 }
-                database_transaction($db, function () use ($db, $user, $target, $name, $email, $role, $password): void {
+                $gender = valid_profile_gender();
+                $hireDate = optional_post_date('hire_date');
+                $emergencyName = optional_post('emergency_contact_name', 150);
+                $emergencyPhone = optional_post('emergency_contact_phone', 40);
+                database_transaction($db, function () use ($db, $user, $target, $name, $email, $role, $password, $gender, $hireDate, $emergencyName, $emergencyPhone): void {
                     $current = $db->prepare('SELECT deleted_at FROM app_profiles WHERE user_id = :id FOR UPDATE');
                     $current->execute(['id' => $target]);
                     $profile = $current->fetch();
@@ -482,6 +592,8 @@ try {
                     $db->prepare(
                         'UPDATE app_profiles SET email = :email, full_name = :name, address = :address,
                          birth_date = :birth_date, phone = :phone, role = CAST(:role AS app_role),
+                         gender = :gender, hire_date = :hire_date,
+                         emergency_contact_name = :emergency_name, emergency_contact_phone = :emergency_phone,
                          updated_at = now() WHERE user_id = :id'
                     )->execute([
                         'email' => $email,
@@ -490,6 +602,10 @@ try {
                         'birth_date' => optional_post_date('birth_date'),
                         'phone' => optional_post('phone', 40),
                         'role' => $role,
+                        'gender' => $gender,
+                        'hire_date' => $hireDate,
+                        'emergency_name' => $emergencyName,
+                        'emergency_phone' => $emergencyPhone,
                         'id' => $target,
                     ]);
                     audit_action($db, $user['id'], 'profile.updated', 'profile', $target, [
@@ -610,9 +726,6 @@ try {
         $user = current_user(false);
     }
     if ($user !== null) {
-        if ($page === 'warranty') {
-            $page = 'dashboard';
-        }
         $pagePermissions = [
             'categories' => ['administrator', 'manager'],
             'brands' => ['administrator', 'manager'],
@@ -620,6 +733,8 @@ try {
             'purchases' => ['administrator', 'manager', 'inventory_staff'],
             'inventory' => ['administrator', 'manager', 'inventory_staff'],
             'returns' => ['administrator', 'manager', 'cashier'],
+            'warranty' => ['administrator', 'manager', 'cashier'],
+            'sales' => ['administrator', 'manager', 'cashier'],
             'receipt' => ['administrator', 'manager', 'cashier'],
             'reports' => ['administrator', 'manager'],
             'audit' => ['administrator', 'manager'],
@@ -629,6 +744,21 @@ try {
             http_response_code(403);
             throw new RuntimeException('Your account is not authorized to view this page.');
         }
+        $notificationReadsReady = notification_reads_applied($db);
+        $notificationUnreadCount = count(notification_rows(
+            $db,
+            $user,
+            $notificationReadsReady,
+            null,
+            $notificationReadsReady
+        ));
+        $notifications = notification_rows(
+            $db,
+            $user,
+            $notificationReadsReady,
+            8,
+            $notificationReadsReady
+        );
     }
 } catch (Throwable $exception) {
     if ($exception instanceof PDOException) {
@@ -636,8 +766,11 @@ try {
         $error = $exception->getCode() === '23505'
             ? 'A record with the same unique identifier already exists (for example, email address, SKU, or barcode).'
             : 'The database operation failed. Check that migrations are applied and review the server error log.';
-    } else {
+    } elseif ($exception instanceof InvalidArgumentException || $exception instanceof RuntimeException || $exception instanceof JsonException) {
         $error = $exception->getMessage();
+    } else {
+        error_log('Unexpected application exception: ' . $exception);
+        $error = 'Something went wrong while processing that action. Your current page is still available; please try again.';
     }
     if (http_response_code() === 403) {
         $page = 'dashboard';
@@ -674,6 +807,99 @@ function require_user_management_migration(PDO $db): void
             'User account management is not ready. Apply database/migrations/003_user_management.sql in the Supabase SQL Editor, then reload this page.'
         );
     }
+}
+
+function user_profile_extensions_applied(PDO $db): bool
+{
+    $statement = $db->query(
+        "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '004_user_profile_extensions')"
+    );
+
+    return in_array($statement->fetchColumn(), [true, 't', '1'], true);
+}
+
+function require_user_profile_extensions(PDO $db): void
+{
+    if (!user_profile_extensions_applied($db)) {
+        throw new RuntimeException(
+            'The additional user profile fields are not ready. Apply database/migrations/004_user_profile_extensions.sql, then reload this page.'
+        );
+    }
+}
+
+function tax_configuration_applied(PDO $db): bool
+{
+    $statement = $db->query(
+        "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '005_global_tax')"
+    );
+
+    return in_array($statement->fetchColumn(), [true, 't', '1'], true);
+}
+
+function discount_percentage_applied(PDO $db): bool
+{
+    $statement = $db->query(
+        "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '006_sales_discount_percentage')"
+    );
+
+    return in_array($statement->fetchColumn(), [true, 't', '1'], true);
+}
+
+function notification_reads_applied(PDO $db): bool
+{
+    $statement = $db->query(
+        "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '007_notification_reads')"
+    );
+
+    return in_array($statement->fetchColumn(), [true, 't', '1'], true);
+}
+
+function require_notification_reads(PDO $db): void
+{
+    if (!notification_reads_applied($db)) {
+        throw new RuntimeException(
+            'Notification read tracking is not installed. Apply database/migrations/007_notification_reads.sql, then reload this page.'
+        );
+    }
+}
+
+function require_discount_percentage(PDO $db): void
+{
+    if (!discount_percentage_applied($db)) {
+        throw new RuntimeException(
+            'Percentage discounts are not installed. Apply database/migrations/006_sales_discount_percentage.sql, then reload this page.'
+        );
+    }
+}
+
+function require_tax_configuration(PDO $db): void
+{
+    if (!tax_configuration_applied($db)) {
+        throw new RuntimeException(
+            'Tax configuration is not installed. Apply database/migrations/005_global_tax.sql, then reload this page.'
+        );
+    }
+}
+
+function current_tax_rate(PDO $db): float
+{
+    require_tax_configuration($db);
+    $rate = $db->query("SELECT setting_value FROM app_settings WHERE setting_key = 'tax_rate'")->fetchColumn();
+    if ($rate === false) {
+        throw new RuntimeException('The global tax setting is missing. Ask an administrator to save the tax rate.');
+    }
+
+    return (float) $rate;
+}
+
+function valid_profile_gender(): ?string
+{
+    $gender = optional_post('gender', 20);
+    if ($gender !== null && !in_array($gender, ['female', 'male', 'other'], true)) {
+        throw new InvalidArgumentException('Choose a valid gender option.');
+    }
+
+    return $gender;
 }
 
 function database_transaction(PDO $db, callable $operation): mixed
@@ -724,6 +950,26 @@ function post_money(string $key): float
     $value = (float) $raw;
     if (!is_finite($value) || $value < 0 || $value > 9999999999.99) {
         throw new InvalidArgumentException('Amount must be between zero and the supported maximum.');
+    }
+
+    function post_percentage(string $key): float
+    {
+        $raw = $_POST[$key] ?? '';
+        if (!is_scalar($raw)) {
+            throw new InvalidArgumentException('Enter a valid discount percentage.');
+        }
+        if (trim((string) $raw) === '') {
+            return 0.0;
+        }
+        if (!is_numeric($raw)) {
+            throw new InvalidArgumentException('Enter a valid discount percentage.');
+        }
+        $value = (float) $raw;
+        if (!is_finite($value) || $value < 0 || $value > 100) {
+            throw new InvalidArgumentException('Discount percentage must be between 0 and 100.');
+        }
+
+        return round($value, 2);
     }
 
     return round($value, 2);
@@ -792,6 +1038,11 @@ function audit_action_label(string $action): string
         'profile.deleted' => 'User account deleted',
         'profile.active_changed' => 'User access status changed',
         'profile.role_changed' => 'User role changed',
+        'inventory.auto_reorder' => 'Automatic reorder created',
+        'warranty_claim.requested' => 'Warranty claim submitted',
+        'warranty_claim.approved' => 'Warranty claim approved',
+        'warranty_claim.rejected' => 'Warranty claim rejected',
+        'settings.tax_rate_updated' => 'Global tax rate updated',
     ];
 
     return $labels[$action] ?? ucwords(str_replace(['.', '_'], ' ', $action));
@@ -833,6 +1084,68 @@ function rows(PDO $db, string $sql, array $params = []): array
     return $statement->fetchAll();
 }
 
+function notification_rows(
+    PDO $db,
+    array $user,
+    bool $unreadOnly = true,
+    ?int $limit = 8,
+    bool $readTrackingReady = true
+): array
+{
+    $sources = "SELECT
+                    CASE WHEN p.stock_quantity = 0 THEN 'out_of_stock' ELSE 'low_stock' END AS kind,
+                    CASE WHEN p.stock_quantity = 0 THEN 'Out of stock' ELSE 'Low stock' END AS title,
+                    p.name || ' · ' || p.sku || ' · ' || p.stock_quantity || ' on hand' AS detail,
+                    'products' AS destination_page,
+                    'stock:' || p.product_id || ':' || p.stock_quantity || ':' || p.updated_at::text AS notification_key,
+                    p.updated_at AS created_at
+                FROM products p
+                WHERE p.is_active AND p.stock_quantity <= p.minimum_stock
+                UNION ALL
+                SELECT 'new_product', 'New product added', p.name || ' · ' || p.sku,
+                       'products', 'new-product:' || p.product_id, p.created_at
+                FROM products p
+                WHERE p.created_at >= now() - INTERVAL '7 days'
+                UNION ALL
+                SELECT 'stock_arrival', 'Stock arrival received',
+                       p.name || ' · ' || p.sku || ' · +' || m.quantity_change || ' unit(s)',
+                       'products', 'stock-arrival:' || m.movement_id, m.created_at
+                FROM inventory_movements m JOIN products p USING (product_id)
+                WHERE m.transaction_type = 'purchase_receipt' AND m.quantity_change > 0
+                  AND m.created_at >= now() - INTERVAL '7 days'";
+    if (role_allows($user, ['administrator', 'manager', 'inventory_staff'])) {
+        $sources .= "
+                UNION ALL
+                SELECT 'pending_purchase', 'Purchase order awaiting delivery',
+                       p.purchase_number || ' · ' || s.name || ' · ' || replace(p.status::text, '_', ' '),
+                       'purchases',
+                       'pending-purchase:' || p.purchase_id || ':' || p.status::text || ':' || p.updated_at::text,
+                       p.updated_at
+                FROM purchases p JOIN suppliers s USING (supplier_id)
+                WHERE p.status IN ('ordered', 'partially_received')";
+    }
+
+    $readProjection = $readTrackingReady
+        ? ', (r.notification_key IS NOT NULL) AS is_read'
+        : ', false AS is_read';
+    $readJoin = $readTrackingReady
+        ? ' LEFT JOIN app_notification_reads r
+              ON r.user_id = :user_id AND r.notification_key = n.notification_key'
+        : '';
+    $sql = 'SELECT n.notification_key, n.kind, n.title, n.detail, n.destination_page,
+                   n.created_at' . $readProjection . '
+            FROM (' . $sources . ') n' . $readJoin;
+    if ($readTrackingReady && $unreadOnly) {
+        $sql .= ' WHERE r.notification_key IS NULL';
+    }
+    $sql .= ' ORDER BY n.created_at DESC, n.notification_key';
+    if ($limit !== null) {
+        $sql .= ' LIMIT ' . max(1, $limit);
+    }
+
+    return rows($db, $sql, $readTrackingReady ? ['user_id' => $user['id']] : []);
+}
+
 function one(PDO $db, string $sql, array $params = []): array
 {
     $statement = $db->prepare($sql);
@@ -870,9 +1183,10 @@ $nav = [
     'brands' => 'Brands',
     'suppliers' => 'Suppliers',
     'purchases' => 'Purchases',
-    'sales' => 'Sales / POS',
+    'sales' => 'Sales',
     'inventory' => 'Inventory',
     'returns' => 'Returns',
+    'warranty' => 'Warranty',
     'reports' => 'Reports',
     'audit' => 'Audit Logs',
     'users' => 'Users',
@@ -896,8 +1210,6 @@ $nav = [
             <p class="eyebrow">INVENTORY SYSTEM</p>
             <h1>Welcome back</h1>
             <p class="text-secondary">Sign in with your Supabase Auth account.</p>
-            <?php if ($authNotice !== ''): ?><div class="alert alert-warning"><?= Security::e($authNotice) ?></div><?php endif; ?>
-            <?php if ($error !== ''): ?><div class="alert alert-danger"><?= Security::e($error) ?></div><?php endif; ?>
             <?php if ($user !== null): ?>
                 <a class="btn btn-primary w-100" href="?page=dashboard">Open dashboard</a>
             <?php else: ?>
@@ -926,6 +1238,8 @@ $nav = [
                     $visible = match ($key) {
                         'categories', 'brands', 'audit' => role_allows($user, ['administrator', 'manager']),
                         'users' => role_allows($user, ['administrator']),
+                        'reports' => role_allows($user, ['administrator', 'manager']),
+                        'warranty' => role_allows($user, ['administrator', 'manager', 'cashier']),
                         'suppliers', 'purchases', 'inventory' => role_allows($user, ['administrator', 'manager', 'inventory_staff']),
                         'sales' => role_allows($user, ['administrator', 'manager', 'cashier']),
                         'returns' => role_allows($user, ['administrator', 'manager', 'cashier']),
@@ -950,17 +1264,61 @@ $nav = [
         <main class="main-content">
             <header class="topbar">
                 <div><p class="eyebrow mb-1">INVENTORY OPERATIONS</p><h1><?= Security::e($page === 'receipt' ? 'Receipt' : ($nav[$page] ?? 'Dashboard')) ?></h1></div>
-                <div class="today-label"><?= date('D, M j, Y') ?></div>
+                <div class="topbar-actions">
+                    <div class="dropdown notification-dropdown">
+                        <button class="btn btn-light notification-button" type="button"
+                                data-bs-toggle="dropdown" aria-expanded="false"
+                                aria-label="Notifications<?= $notificationUnreadCount > 0 ? ' (' . $notificationUnreadCount . ($notificationReadsReady ? ' unread' : ' active') . ')' : '' ?>">
+                            <svg class="notification-bell" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" />
+                            </svg>
+                            <?php if ($notificationUnreadCount > 0): ?><span class="notification-count"><?= min($notificationUnreadCount, 99) ?><?= $notificationUnreadCount > 99 ? '+' : '' ?></span><?php endif; ?>
+                        </button>
+                        <div class="dropdown-menu dropdown-menu-end notification-menu">
+                            <div class="notification-heading">
+                                <span><?= $notificationReadsReady ? 'Unread notifications' : 'Recent notifications' ?> <strong><?= $notificationUnreadCount ?></strong></span>
+                                <?php if ($notificationReadsReady && $notificationUnreadCount > 0): ?>
+                                    <form method="post" class="notification-mark-all">
+                                        <?= csrf_field() ?><input type="hidden" name="action" value="notifications_mark_all">
+                                        <input type="hidden" name="return_page" value="<?= Security::e($page) ?>">
+                                        <button class="btn btn-sm btn-link" type="submit">Mark all read</button>
+                                    </form>
+                                <?php endif; ?>
+                            </div>
+                            <?php if ($notifications): ?>
+                                <?php foreach ($notifications as $notification): ?>
+                                    <?php if ($notificationReadsReady): ?>
+                                        <form method="post" class="notification-read-form">
+                                            <?= csrf_field() ?><input type="hidden" name="action" value="notification_mark_read">
+                                            <input type="hidden" name="notification_key" value="<?= Security::e($notification['notification_key']) ?>">
+                                            <button class="dropdown-item notification-item" type="submit">
+                                    <?php else: ?>
+                                        <a class="dropdown-item notification-item" href="?page=<?= Security::e($notification['destination_page']) ?>">
+                                    <?php endif; ?>
+                                            <strong><?= Security::e($notification['title']) ?></strong>
+                                            <span><?= Security::e($notification['detail']) ?></span>
+                                            <small><?= Security::e(date('M j, g:i A', strtotime($notification['created_at']))) ?></small>
+                                    <?php if ($notificationReadsReady): ?></button></form><?php else: ?></a><?php endif; ?>
+                                <?php endforeach; ?>
+                            <?php else: ?>
+                                <div class="notification-empty"><?= $notificationReadsReady ? "You're all caught up. No unread inventory notifications." : 'No current inventory notifications.' ?></div>
+                            <?php endif; ?>
+                            <?php if (!$notificationReadsReady): ?><div class="notification-setup-note">Apply <code>007_notification_reads.sql</code> to enable per-user read tracking.</div><?php endif; ?>
+                        </div>
+                    </div>
+                    <div class="today-label"><?= date('D, M j, Y') ?></div>
+                </div>
             </header>
             <section class="content">
-                <?php if ($error !== ''): ?><div class="alert alert-danger"><?= Security::e($error) ?></div><?php endif; ?>
-                <?php if ($notice !== ''): ?><div class="alert alert-success"><?= Security::e($notice) ?></div><?php endif; ?>
                 <?php if ($user === null || $db === null): ?>
                     <div class="alert alert-warning">Your session is not active. <a href="?page=login">Sign in</a>.</div>
                 <?php else: ?>
                 <?php
                 $canManage = role_allows($user, ['administrator', 'manager']);
                 $canInventory = role_allows($user, ['administrator', 'manager', 'inventory_staff']);
+                $taxSettingsReady = tax_configuration_applied($db);
+                $discountPercentageReady = discount_percentage_applied($db);
+                $taxRate = $taxSettingsReady ? current_tax_rate($db) : 0.0;
                 $today = date('Y-m-d');
                 $search = trim((string) ($_GET['q'] ?? ''));
                 $pageNumber = max(1, (int) ($_GET['p'] ?? 1));
@@ -1084,13 +1442,13 @@ $nav = [
                         <?php if ($canManage): ?><td><button class="btn btn-sm btn-outline-secondary" data-product="<?= Security::e(json_encode($product, JSON_HEX_APOS | JSON_HEX_QUOT)) ?>" onclick="editProduct(this)">Edit</button></td><?php endif; ?></tr><?php endforeach; ?>
                     <?php if (!$products): ?><tr><td colspan="7" class="text-secondary">No products match this search.</td></tr><?php endif; ?>
                     </tbody></table></div><div class="panel-foot"><span>Page <?= $pageNumber ?></span><div><a class="btn btn-sm btn-outline-secondary <?= $pageNumber <= 1 ? 'disabled' : '' ?>" href="?page=products&q=<?= rawurlencode($search) ?>&p=<?= max(1, $pageNumber - 1) ?>">Previous</a> <a class="btn btn-sm btn-outline-secondary" href="?page=products&q=<?= rawurlencode($search) ?>&p=<?= $pageNumber + 1 ?>">Next</a></div></div></article>
-                    <?php if ($canInventory): ?><div class="modal fade" id="productModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><form method="post"><?= csrf_field() ?><input type="hidden" name="action" value="product_create"><div class="modal-header"><h2 class="modal-title fs-5">Add product</h2><button class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="row g-3">
+                    <?php if ($canInventory): ?><div class="modal fade" id="productModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><form method="post"><?= csrf_field() ?><input type="hidden" name="action" value="product_create"><div class="modal-header"><h2 class="modal-title fs-5">Add product</h2><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="row g-3">
                         <div class="col-md-4"><label class="form-label">SKU<input class="form-control" name="sku" required maxlength="80"></label></div><div class="col-md-4"><label class="form-label">Barcode<input class="form-control" name="barcode"></label></div><div class="col-md-4"><label class="form-label">Product name<input class="form-control" name="name" required></label></div>
                         <div class="col-md-4"><label class="form-label">Category<select class="form-select" name="category_id"><option value="">None</option><?php foreach ($categories as $c): ?><option value="<?= $c['category_id'] ?>"><?= Security::e($c['name']) ?></option><?php endforeach; ?></select></label></div><div class="col-md-4"><label class="form-label">Brand<select class="form-select" name="brand_id"><option value="">None</option><?php foreach ($brands as $b): ?><option value="<?= $b['brand_id'] ?>"><?= Security::e($b['name']) ?></option><?php endforeach; ?></select></label></div><div class="col-md-4"><label class="form-label">Model<input class="form-control" name="model"></label></div>
                         <div class="col-md-3"><label class="form-label">Selling price<input class="form-control" name="selling_price" type="number" step=".01" min="0" required></label></div><div class="col-md-3"><label class="form-label">Minimum stock<input class="form-control" name="minimum_stock" type="number" min="0" value="0"></label></div><div class="col-md-3"><label class="form-label">Warranty (months)<input class="form-control" name="warranty_months" type="number" min="0"></label></div><div class="col-md-3"><label class="form-label">Unit<input class="form-control" name="unit" value="unit" required></label></div>
                         <div class="col-md-4"><label class="form-label">Socket spec<input class="form-control" name="spec_socket"></label></div><div class="col-md-4"><label class="form-label">Capacity spec<input class="form-control" name="spec_capacity"></label></div><div class="col-md-4"><label class="form-label">Interface spec<input class="form-control" name="spec_interface"></label></div><div class="col-12"><label class="form-label">Description<textarea class="form-control" name="description" rows="2"></textarea></label></div>
-                    </div><p class="small text-secondary mt-3">Initial inventory must enter through a purchase receipt or authorized adjustment.</p></div><div class="modal-footer"><button class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary">Save product</button></div></form></div></div></div><?php endif; ?>
-                    <?php if ($canManage): ?><div class="modal fade" id="editProductModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><form method="post"><?= csrf_field() ?><input type="hidden" name="action" value="product_update"><input type="hidden" id="edit-product-id" name="product_id"><div class="modal-header"><h2 class="modal-title fs-5">Edit product</h2><button class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><label class="form-label">Name<input class="form-control" id="edit-product-name" name="name" required></label><label class="form-label">Description<textarea class="form-control" id="edit-product-description" name="description"></textarea></label><label class="form-label">Selling price<input class="form-control" id="edit-product-price" name="selling_price" type="number" min="0" step=".01" required></label><label class="form-label">Minimum stock<input class="form-control" id="edit-product-min" name="minimum_stock" type="number" min="0" required></label><label class="form-check"><input class="form-check-input" id="edit-product-active" name="is_active" type="checkbox" value="1"> Active for sale</label></div><div class="modal-footer"><button class="btn btn-primary">Save changes</button></div></form></div></div></div><?php endif; ?>
+                    </div><p class="small text-secondary mt-3">Initial inventory must enter through a purchase receipt or authorized adjustment.</p></div><div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary">Save product</button></div></form></div></div></div><?php endif; ?>
+                    <?php if ($canManage): ?><div class="modal fade" id="editProductModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content"><form method="post"><?= csrf_field() ?><input type="hidden" name="action" value="product_update"><input type="hidden" id="edit-product-id" name="product_id"><div class="modal-header"><h2 class="modal-title fs-5">Edit product</h2><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><div class="modal-form-grid"><label class="form-label">Name<input class="form-control mt-1" id="edit-product-name" name="name" required></label><label class="form-label">Selling price<input class="form-control mt-1" id="edit-product-price" name="selling_price" type="number" min="0" step=".01" required></label><label class="form-label">Minimum stock<input class="form-control mt-1" id="edit-product-min" name="minimum_stock" type="number" min="0" required></label><label class="form-check align-self-end"><input class="form-check-input" id="edit-product-active" name="is_active" type="checkbox" value="1"> Active for sale</label><label class="form-label full-width">Description<textarea class="form-control mt-1" id="edit-product-description" name="description"></textarea></label></div></div><div class="modal-footer"><button class="btn btn-primary">Save changes</button></div></form></div></div></div><?php endif; ?>
 
                 <?php elseif ($page === 'categories' || $page === 'brands'):
                     $isCategory = $page === 'categories';
@@ -1110,34 +1468,126 @@ $nav = [
                     );
                     $products = rows($db, 'SELECT product_id, sku, name FROM products WHERE is_active ORDER BY name');
                 ?>
-                    <?php if ($canInventory): ?><article class="panel mb-3"><h2>Add supplier</h2><form method="post" class="row g-3 mt-1"><?= csrf_field() ?><input type="hidden" name="action" value="supplier_create"><div class="col-md-3"><input class="form-control" name="name" placeholder="Supplier name" required></div><div class="col-md-2"><input class="form-control" name="contact_person" placeholder="Contact person"></div><div class="col-md-2"><input class="form-control" name="phone" placeholder="Phone"></div><div class="col-md-2"><input class="form-control" name="email" type="email" placeholder="Email"></div><div class="col-md-2"><input class="form-control" name="address" placeholder="Address"></div><div class="col-md-1"><button class="btn btn-primary">Add</button></div></form></article><?php endif; ?>
+                    <div class="page-toolbar"><div><h2 class="h5 mb-1">Suppliers</h2><p class="text-secondary small mb-0">Manage supplier details and product costs.</p></div><?php if ($canInventory): ?><button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#supplierModal">＋ Add supplier</button><?php endif; ?></div>
+                    <?php if ($canInventory): ?><div class="modal fade" id="supplierModal" tabindex="-1" aria-labelledby="supplierModalTitle" aria-hidden="true"><div class="modal-dialog modal-dialog-centered"><div class="modal-content"><form method="post"><?= csrf_field() ?><input type="hidden" name="action" value="supplier_create"><div class="modal-header"><h2 class="modal-title fs-5" id="supplierModalTitle">Register supplier</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div><div class="modal-body"><div class="modal-form-grid"><label class="form-label">Supplier name<input class="form-control mt-1" name="name" maxlength="250" required></label><label class="form-label">Contact person<input class="form-control mt-1" name="contact_person" maxlength="150"></label><label class="form-label">Phone<input class="form-control mt-1" name="phone" maxlength="40" type="tel"></label><label class="form-label">Email<input class="form-control mt-1" name="email" maxlength="254" type="email"></label><label class="form-label full-width">Address<textarea class="form-control mt-1" name="address" maxlength="500" rows="3"></textarea></label></div></div><div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary">Save supplier</button></div></form></div></div></div><?php endif; ?>
                     <article class="panel"><div class="table-responsive"><table class="table"><thead><tr><th>Supplier</th><th>Contact</th><th>Phone</th><th>Email</th><th>Address</th><th>Status</th><th>Manage</th></tr></thead><tbody><?php foreach ($suppliers as $supplier): ?><tr><td><?= Security::e($supplier['name']) ?></td><td><?= Security::e($supplier['contact_person'] ?? '') ?></td><td><?= Security::e($supplier['phone'] ?? '') ?></td><td><?= Security::e($supplier['email'] ?? '') ?></td><td><?= Security::e($supplier['address'] ?? '') ?></td><td><?= $supplier['active_int'] ? 'Active' : 'Inactive' ?></td><td><details><summary class="btn btn-sm btn-outline-secondary">Edit</summary><form method="post" class="vstack gap-2 mt-2"><?= csrf_field() ?><input type="hidden" name="action" value="supplier_update"><input type="hidden" name="supplier_id" value="<?= (int) $supplier['supplier_id'] ?>"><label class="form-label mb-0">Name<input class="form-control" name="name" maxlength="250" value="<?= Security::e($supplier['name']) ?>" required></label><label class="form-label mb-0">Contact<input class="form-control" name="contact_person" value="<?= Security::e($supplier['contact_person'] ?? '') ?>"></label><label class="form-label mb-0">Phone<input class="form-control" name="phone" value="<?= Security::e($supplier['phone'] ?? '') ?>"></label><label class="form-label mb-0">Email<input class="form-control" name="email" type="email" value="<?= Security::e($supplier['email'] ?? '') ?>"></label><label class="form-label mb-0">Address<input class="form-control" name="address" value="<?= Security::e($supplier['address'] ?? '') ?>"></label><label class="form-check"><input class="form-check-input" type="checkbox" name="is_active" value="1" <?= $supplier['active_int'] ? 'checked' : '' ?>> Active</label><button class="btn btn-sm btn-primary">Save supplier</button></form></details></td></tr><?php endforeach; ?></tbody></table></div></article>
                     <?php if ($canInventory): ?><article class="panel mt-3"><h2>Supplier product catalog</h2><p>Maintain the supplier's SKU relationships and latest quoted unit cost.</p><form method="post" class="row g-3 align-items-end mt-1"><?= csrf_field() ?><input type="hidden" name="action" value="supplier_product_save"><div class="col-md-4"><label class="form-label">Supplier<select class="form-select" name="supplier_id" required><option value="">Select supplier</option><?php foreach ($suppliers as $supplier): ?><?php if ($supplier['active_int']): ?><option value="<?= (int) $supplier['supplier_id'] ?>"><?= Security::e($supplier['name']) ?></option><?php endif; ?><?php endforeach; ?></select></label></div><div class="col-md-5"><label class="form-label">Product<select class="form-select" name="product_id" required><option value="">Select product</option><?php foreach ($products as $product): ?><option value="<?= (int) $product['product_id'] ?>"><?= Security::e($product['sku'] . ' · ' . $product['name']) ?></option><?php endforeach; ?></select></label></div><div class="col-md-2"><label class="form-label">Latest unit cost<input class="form-control" name="last_unit_cost" type="number" min="0" step=".01" required></label></div><div class="col-md-1"><button class="btn btn-primary">Save</button></div></form><div class="table-responsive"><table class="table"><thead><tr><th>Supplier</th><th>Product</th><th>Latest unit cost</th><th></th></tr></thead><tbody><?php foreach ($supplierProducts as $mapping): ?><tr><td><?= Security::e($mapping['supplier']) ?></td><td><?= Security::e($mapping['sku'] . ' · ' . $mapping['product']) ?></td><td><?= $mapping['last_unit_cost'] === null ? '—' : '₱' . number_format((float) $mapping['last_unit_cost'], 2) ?></td><td><form method="post" data-confirm="Remove this supplier-product mapping?"><?= csrf_field() ?><input type="hidden" name="action" value="supplier_product_delete"><input type="hidden" name="supplier_id" value="<?= (int) $mapping['supplier_id'] ?>"><input type="hidden" name="product_id" value="<?= (int) $mapping['product_id'] ?>"><button class="btn btn-sm btn-outline-danger">Remove</button></form></td></tr><?php endforeach; ?><?php if (!$supplierProducts): ?><tr><td colspan="4" class="text-secondary">No supplier products mapped.</td></tr><?php endif; ?></tbody></table></div></article><?php endif; ?>
 
                 <?php elseif ($page === 'purchases'):
                     $suppliers = rows($db, 'SELECT supplier_id, name FROM suppliers WHERE is_active ORDER BY name');
                     $products = rows($db, 'SELECT product_id, sku, name FROM products WHERE is_active ORDER BY name');
-                    $purchaseRows = rows($db,
-                        'SELECT p.*, s.name AS supplier, ap.full_name AS creator, pi.purchase_item_id, pi.product_id, pi.ordered_quantity, pi.received_quantity, pi.unit_cost, pr.name AS product, pr.sku
-                         FROM purchases p JOIN suppliers s USING (supplier_id) JOIN app_profiles ap ON ap.user_id = p.created_by
-                         JOIN purchase_items pi USING (purchase_id) JOIN products pr USING (product_id)
-                         WHERE p.purchase_id IN (SELECT purchase_id FROM purchases ORDER BY created_at DESC LIMIT 100)
-                         ORDER BY p.created_at DESC, pi.purchase_item_id'
+                    $purchaseHeaders = rows($db,
+                        'SELECT p.*, s.name AS supplier, ap.full_name AS creator,
+                                (SELECT count(*) FROM purchase_items pi WHERE pi.purchase_id = p.purchase_id) AS line_count,
+                                (SELECT COALESCE(sum(pi.ordered_quantity), 0) FROM purchase_items pi
+                                 WHERE pi.purchase_id = p.purchase_id) AS total_units
+                         FROM purchases p
+                         JOIN suppliers s USING (supplier_id)
+                         JOIN app_profiles ap ON ap.user_id = p.created_by
+                         ORDER BY p.created_at DESC, p.purchase_id DESC LIMIT 100'
                     );
                     $purchases = [];
-                    foreach ($purchaseRows as $purchaseRow) {
-                        $purchaseId = (int) $purchaseRow['purchase_id'];
-                        if (!isset($purchases[$purchaseId])) {
-                            $purchases[$purchaseId] = ['header' => $purchaseRow, 'items' => []];
-                        }
-                        $purchases[$purchaseId]['items'][] = $purchaseRow;
+                    foreach ($purchaseHeaders as $purchaseHeader) {
+                        $purchases[(int) $purchaseHeader['purchase_id']] = [
+                            'header' => $purchaseHeader,
+                            'items' => [],
+                        ];
                     }
+                    if ($purchases !== []) {
+                        $purchaseIds = array_keys($purchases);
+                        $itemPlaceholders = implode(', ', array_fill(0, count($purchaseIds), '?'));
+                        $purchaseItems = rows(
+                            $db,
+                            'SELECT pi.*, p.name AS product, p.sku
+                             FROM purchase_items pi
+                             JOIN products p USING (product_id)
+                             WHERE pi.purchase_id IN (' . $itemPlaceholders . ')
+                             ORDER BY pi.purchase_id, pi.purchase_item_id',
+                            $purchaseIds
+                        );
+                        foreach ($purchaseItems as $purchaseItem) {
+                            $purchaseId = (int) $purchaseItem['purchase_id'];
+                            if (isset($purchases[$purchaseId])) {
+                                $purchases[$purchaseId]['items'][] = $purchaseItem;
+                            }
+                        }
+                    }
+                    $reorderSuggestions = (new InventoryService($db))->reorderSuggestions();
                 ?>
-                    <?php if ($canInventory): ?><article class="panel mb-3"><h2>Create purchase order</h2><form method="post" class="mt-1" id="purchase-form"><?= csrf_field() ?><input type="hidden" name="action" value="purchase_create"><div class="row g-3"><div class="col-md-5"><label class="form-label">Supplier<select class="form-select" name="supplier_id" required><option value="">Select supplier</option><?php foreach ($suppliers as $supplier): ?><option value="<?= (int) $supplier['supplier_id'] ?>"><?= Security::e($supplier['name']) ?></option><?php endforeach; ?></select></label></div><div class="col-md-7 d-flex align-items-end"><p class="small text-secondary mb-2">Add up to 50 distinct products. Each line can be received in multiple deliveries.</p></div></div><div id="purchase-lines" class="vstack gap-2 mt-2"><div class="row g-2 align-items-end purchase-line"><div class="col-md-6"><label class="form-label">Product<select class="form-select" name="product_id[]" required><option value="">Select product</option><?php foreach ($products as $product): ?><option value="<?= (int) $product['product_id'] ?>"><?= Security::e($product['sku'] . ' · ' . $product['name']) ?></option><?php endforeach; ?></select></label></div><div class="col-md-2"><label class="form-label">Quantity<input class="form-control" name="quantity[]" type="number" min="1" required></label></div><div class="col-md-2"><label class="form-label">Unit cost<input class="form-control" name="unit_cost[]" type="number" min="0" max="9999999999.99" step=".01" required></label></div><div class="col-md-2"><button type="button" class="btn btn-outline-danger remove-purchase-line" disabled>Remove</button></div></div></div><template id="purchase-line-template"><div class="row g-2 align-items-end purchase-line"><div class="col-md-6"><label class="form-label">Product<select class="form-select" name="product_id[]" required><option value="">Select product</option><?php foreach ($products as $product): ?><option value="<?= (int) $product['product_id'] ?>"><?= Security::e($product['sku'] . ' · ' . $product['name']) ?></option><?php endforeach; ?></select></label></div><div class="col-md-2"><label class="form-label">Quantity<input class="form-control" name="quantity[]" type="number" min="1" required></label></div><div class="col-md-2"><label class="form-label">Unit cost<input class="form-control" name="unit_cost[]" type="number" min="0" max="9999999999.99" step=".01" required></label></div><div class="col-md-2"><button type="button" class="btn btn-outline-danger remove-purchase-line">Remove</button></div></div></template><div class="d-flex gap-2 mt-3"><button type="button" class="btn btn-outline-primary" id="add-purchase-line">Add product line</button><button class="btn btn-primary">Create order</button></div></form></article><?php endif; ?>
-                    <article class="panel"><h2>Purchase orders</h2><div class="table-responsive"><table class="table align-middle"><thead><tr><th>Purchase</th><th>Supplier</th><th>Product</th><th>Ordered / Received</th><th>Cost</th><th>Status</th><?php if ($canInventory): ?><th>Receive</th><?php endif; ?></tr></thead><?php foreach ($purchases as $purchaseGroup): ?><?php $purchase = $purchaseGroup['header']; ?><tbody><tr class="table-light"><th colspan="<?= $canInventory ? 7 : 6 ?>"><?= Security::e($purchase['purchase_number']) ?> · <?= Security::e($purchase['supplier']) ?><small class="d-block text-secondary"><?= Security::e(date('M j, Y', strtotime($purchase['created_at']))) ?> · <?= count($purchaseGroup['items']) ?> item(s) · Order total $<?= number_format((float) $purchase['total_amount'], 2) ?></small></th></tr><?php foreach ($purchaseGroup['items'] as $item): ?><tr><td><?= Security::e($purchase['purchase_number']) ?></td><td><?= Security::e($purchase['supplier']) ?></td><td><?= Security::e($item['sku'] . ' · ' . $item['product']) ?></td><td><?= Security::e($item['ordered_quantity']) ?> / <?= Security::e($item['received_quantity']) ?></td><td>₱<?= number_format((float) $item['unit_cost'], 2) ?></td><td><span class="badge text-bg-light"><?= Security::e(str_replace('_', ' ', $purchase['status'])) ?></span></td><?php if ($canInventory): ?><td><?php if (!in_array($purchase['status'], ['received', 'cancelled'], true) && (int) $item['received_quantity'] < (int) $item['ordered_quantity']): ?><form method="post" class="receive-form"><?= csrf_field() ?><input type="hidden" name="action" value="purchase_receive"><input type="hidden" name="purchase_id" value="<?= (int) $purchase['purchase_id'] ?>"><input type="hidden" name="purchase_item_id" value="<?= (int) $item['purchase_item_id'] ?>"><?= request_key_field() ?><div class="input-group input-group-sm"><input class="form-control" name="quantity" type="number" min="1" max="<?= (int) $item['ordered_quantity'] - (int) $item['received_quantity'] ?>" placeholder="Qty" required><button class="btn btn-outline-primary">Receive</button></div></form><?php else: ?>—<?php endif; ?></td><?php endif; ?></tr><?php endforeach; ?></tbody><?php endforeach; ?><?php if (!$purchases): ?><tbody><tr><td colspan="<?= $canInventory ? 7 : 6 ?>" class="text-secondary">No purchase orders yet.</td></tr></tbody><?php endif; ?></table></div></article>
+                    <div class="page-toolbar"><div><h2 class="h5 mb-1">Purchase orders</h2><p class="text-secondary small mb-0">Create orders, validate each line, and receive deliveries against outstanding quantities.</p></div><?php if ($canInventory): ?><div class="d-flex gap-2"><form method="post" data-confirm="Create purchase orders for eligible low-stock products using the lowest-cost active supplier?"><?= csrf_field() ?><input type="hidden" name="action" value="auto_reorder"><button class="btn btn-outline-primary" <?= !$taxSettingsReady ? 'disabled title="Apply the global tax migration first."' : '' ?>>Suggest &amp; reorder</button></form><button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#purchaseModal">＋ Create purchase</button></div><?php endif; ?></div>
+                    <?php if (!$taxSettingsReady && $canInventory): ?><div class="alert alert-warning small">Purchase tax and automatic reorder require migration <code>005_global_tax.sql</code>.</div><?php endif; ?>
+                    <?php if ($canInventory && $reorderSuggestions): ?><article class="panel mb-3"><div class="panel-heading"><div><h2>Low-stock reorder suggestions</h2><p>Open orders are accounted for; automatic orders use the lowest-cost active supplier.</p></div></div><div class="table-responsive"><table class="table align-middle"><thead><tr><th>Product</th><th>On hand / minimum</th><th>Suggested quantity</th><th>Supplier</th><th>Unit cost</th></tr></thead><tbody><?php foreach ($reorderSuggestions as $suggestion): ?><?php if ((int) $suggestion['suggested_quantity'] > 0): ?><tr><td><strong><?= Security::e($suggestion['name']) ?></strong><small class="d-block text-secondary"><?= Security::e($suggestion['sku']) ?></small></td><td><?= (int) $suggestion['stock_quantity'] ?> / <?= (int) $suggestion['minimum_stock'] ?></td><td><?= (int) $suggestion['suggested_quantity'] ?></td><td><?= Security::e($suggestion['supplier_name'] ?? 'No supplier mapped') ?></td><td><?= $suggestion['supplier_id'] === null ? '—' : format_currency($suggestion['unit_cost']) ?></td></tr><?php endif; ?><?php endforeach; ?></tbody></table></div></article><?php endif; ?>
+                    <?php if ($canInventory): ?><div class="modal fade" id="purchaseModal" tabindex="-1" aria-labelledby="purchaseModalTitle" aria-hidden="true"><div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content"><form method="post" id="purchase-form"><?= csrf_field() ?><input type="hidden" name="action" value="purchase_create"><div class="modal-header"><div><h2 class="modal-title fs-5" id="purchaseModalTitle">Create purchase order</h2><p class="small text-secondary mb-0">Tax rate: <?= number_format($taxRate, 2) ?>% · applied automatically</p></div><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div><div class="modal-body"><div class="row g-3"><div class="col-md-6"><label class="form-label">Supplier<select class="form-select" name="supplier_id" required><option value="">Select supplier</option><?php foreach ($suppliers as $supplier): ?><option value="<?= (int) $supplier['supplier_id'] ?>"><?= Security::e($supplier['name']) ?></option><?php endforeach; ?></select></label></div><div class="col-md-6 d-flex align-items-end"><p class="small text-secondary mb-2">Add up to 50 distinct products. Each line can be received in multiple verified deliveries.</p></div></div><div id="purchase-lines" class="vstack gap-2 mt-3"><div class="row g-2 align-items-end purchase-line"><div class="col-md-6"><label class="form-label">Product<select class="form-select" name="product_id[]" required><option value="">Select product</option><?php foreach ($products as $product): ?><option value="<?= (int) $product['product_id'] ?>"><?= Security::e($product['sku'] . ' · ' . $product['name']) ?></option><?php endforeach; ?></select></label></div><div class="col-md-2"><label class="form-label">Quantity<input class="form-control" name="quantity[]" type="number" min="1" step="1" required></label></div><div class="col-md-2"><label class="form-label">Unit cost<input class="form-control" name="unit_cost[]" type="number" min="0" max="9999999999.99" step=".01" required></label></div><div class="col-md-2"><button type="button" class="btn btn-outline-danger remove-purchase-line" disabled>Remove</button></div></div></div><template id="purchase-line-template"><div class="row g-2 align-items-end purchase-line"><div class="col-md-6"><label class="form-label">Product<select class="form-select" name="product_id[]" required><option value="">Select product</option><?php foreach ($products as $product): ?><option value="<?= (int) $product['product_id'] ?>"><?= Security::e($product['sku'] . ' · ' . $product['name']) ?></option><?php endforeach; ?></select></label></div><div class="col-md-2"><label class="form-label">Quantity<input class="form-control" name="quantity[]" type="number" min="1" step="1" required></label></div><div class="col-md-2"><label class="form-label">Unit cost<input class="form-control" name="unit_cost[]" type="number" min="0" max="9999999999.99" step=".01" required></label></div><div class="col-md-2"><button type="button" class="btn btn-outline-danger remove-purchase-line">Remove</button></div></div></template><div class="d-flex justify-content-between align-items-center mt-3"><button type="button" class="btn btn-outline-primary" id="add-purchase-line">Add product line</button><strong>Estimated total with tax: <output id="purchase-total">₱0.00</output></strong></div></div><div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary">Review &amp; create order</button></div></form></div></div></div><?php endif; ?>
+                    <article class="panel">
+                        <h2>Purchase order history</h2>
+                        <div class="table-responsive">
+                            <table class="table align-middle">
+                                <thead><tr><th>Purchase order</th><th>Supplier</th><th>Order date</th><th>Product lines</th><th>Total units</th><th class="text-end">Total</th><th>Status</th><th>Details</th></tr></thead>
+                                <tbody>
+                                    <?php foreach ($purchases as $purchaseGroup): ?>
+                                        <?php $purchase = $purchaseGroup['header']; $purchaseId = (int) $purchase['purchase_id']; ?>
+                                        <tr>
+                                            <td><strong><?= Security::e($purchase['purchase_number']) ?></strong></td>
+                                            <td><?= Security::e($purchase['supplier']) ?></td>
+                                            <td><?= Security::e(date('M j, Y', strtotime($purchase['created_at']))) ?><small class="d-block text-secondary">By <?= Security::e($purchase['creator']) ?></small></td>
+                                            <td><?= (int) $purchase['line_count'] ?></td>
+                                            <td><?= (int) $purchase['total_units'] ?></td>
+                                            <td class="text-end"><?= format_currency($purchase['total_amount']) ?><small class="d-block text-secondary">Tax <?= format_currency($purchase['tax_amount'] ?? 0) ?></small></td>
+                                            <td><span class="badge text-bg-light"><?= Security::e(str_replace('_', ' ', $purchase['status'])) ?></span></td>
+                                            <td><button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#purchase-details-<?= $purchaseId ?>" aria-expanded="false" aria-controls="purchase-details-<?= $purchaseId ?>">View details</button></td>
+                                        </tr>
+                                        <tr class="purchase-details-row">
+                                            <td colspan="8">
+                                                <div class="collapse" id="purchase-details-<?= $purchaseId ?>">
+                                                <div class="table-responsive">
+                                                    <table class="table table-sm align-middle mb-0">
+                                                        <thead><tr><th>Product</th><th>Ordered / received</th><th>Unit cost</th><th>Line total</th><?php if ($canInventory): ?><th>Receive</th><?php endif; ?></tr></thead>
+                                                        <tbody>
+                                                            <?php foreach ($purchaseGroup['items'] as $item): ?>
+                                                                <tr>
+                                                                    <td><?= Security::e($item['sku'] . ' · ' . $item['product']) ?></td>
+                                                                    <td><?= (int) $item['ordered_quantity'] ?> / <?= (int) $item['received_quantity'] ?></td>
+                                                                    <td><?= format_currency($item['unit_cost']) ?></td>
+                                                                    <td><?= format_currency((float) $item['ordered_quantity'] * (float) $item['unit_cost']) ?></td>
+                                                                    <?php if ($canInventory): ?>
+                                                                        <td>
+                                                                            <?php if (!in_array($purchase['status'], ['received', 'cancelled'], true) && (int) $item['received_quantity'] < (int) $item['ordered_quantity']): ?>
+                                                                                <form method="post" class="receive-form" data-confirm="Confirm the delivered quantity and add it to inventory?">
+                                                                                    <?= csrf_field() ?><input type="hidden" name="action" value="purchase_receive">
+                                                                                    <input type="hidden" name="purchase_id" value="<?= $purchaseId ?>">
+                                                                                    <input type="hidden" name="purchase_item_id" value="<?= (int) $item['purchase_item_id'] ?>">
+                                                                                    <?= request_key_field() ?>
+                                                                                    <div class="input-group input-group-sm">
+                                                                                        <input class="form-control" name="quantity" type="number" min="1" max="<?= (int) $item['ordered_quantity'] - (int) $item['received_quantity'] ?>" placeholder="Qty" aria-label="Quantity to receive" required>
+                                                                                        <button class="btn btn-outline-primary">Receive</button>
+                                                                                    </div>
+                                                                                </form>
+                                                                            <?php else: ?>—<?php endif; ?>
+                                                                        </td>
+                                                                    <?php endif; ?>
+                                                                </tr>
+                                                            <?php endforeach; ?>
+                                                            <?php if (!$purchaseGroup['items']): ?><tr><td colspan="<?= $canInventory ? 5 : 4 ?>" class="text-secondary">No product lines found.</td></tr><?php endif; ?>
+                                                        </tbody>
+                                                    </table>
+                                                </div>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                    <?php if (!$purchases): ?><tr><td colspan="8" class="text-secondary">No purchase orders yet.</td></tr><?php endif; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                    </article>
 
                 <?php elseif ($page === 'sales'):
-                    $products = rows($db, 'SELECT product_id, sku, name, selling_price, stock_quantity FROM products WHERE is_active AND stock_quantity > 0 ORDER BY name');
+                    $products = rows($db,
+                        'SELECT p.product_id, p.sku, p.barcode, p.name, p.model, p.selling_price, p.stock_quantity,
+                                b.name AS brand
+                         FROM products p LEFT JOIN brands b USING (brand_id)
+                         WHERE p.is_active AND p.stock_quantity > 0 ORDER BY p.name'
+                    );
                     $sales = rows($db,
                         "SELECT s.*, p.full_name FROM sales s JOIN app_profiles p ON p.user_id = s.cashier_id
                          WHERE TRUE" . ($canManage ? '' : ' AND s.cashier_id = :cashier') . "
@@ -1145,13 +1595,40 @@ $nav = [
                         $canManage ? [] : ['cashier' => $user['id']]
                     );
                 ?>
-                    <?php if (role_allows($user, ['administrator', 'manager', 'cashier'])): ?><article class="panel mb-3"><div class="panel-heading"><div><h2>Point of sale</h2><p>Stock is revalidated and reserved inside checkout transaction.</p></div></div>
-                    <form id="checkout-form" method="post"><?= csrf_field() ?><input type="hidden" name="action" value="sale_checkout"><?= request_key_field() ?><input type="hidden" name="cart" id="cart-json">
-                        <div class="row g-3 align-items-end"><div class="col-md-6"><label class="form-label">Product<select id="pos-product" class="form-select"><option value="">Choose an in-stock product</option><?php foreach ($products as $p): ?><option value="<?= $p['product_id'] ?>" data-price="<?= Security::e($p['selling_price']) ?>" data-stock="<?= $p['stock_quantity'] ?>"><?= Security::e($p['sku'] . ' · ' . $p['name']) ?> · <?= $p['stock_quantity'] ?> available · $<?= number_format((float) $p['selling_price'], 2) ?></option><?php endforeach; ?></select></label></div><div class="col-md-2"><label class="form-label">Qty<input class="form-control" type="number" id="pos-quantity" min="1" value="1"></label></div><div class="col-md-2"><button type="button" class="btn btn-outline-primary" id="add-to-cart">Add item</button></div></div>
-                        <div class="table-responsive mt-3"><table class="table" id="cart-table"><thead><tr><th>Product</th><th>Qty</th><th>Price</th><th>Total</th><th></th></tr></thead><tbody><tr class="cart-empty"><td colspan="5" class="text-secondary">Your cart is empty.</td></tr></tbody></table></div>
-                        <div class="row g-3 justify-content-end"><div class="col-md-2"><label class="form-label">Discount<input class="form-control" name="discount" type="number" min="0" step=".01" value="0"></label></div><div class="col-md-2"><label class="form-label">Tax<input class="form-control" name="tax" type="number" min="0" step=".01" value="0"></label></div><div class="col-md-2"><label class="form-label">Payment<select name="payment_method" class="form-select"><option value="cash">Cash</option><option value="card">Card</option><option value="bank_transfer">Bank transfer</option><option value="other">Other</option></select></label></div><div class="col-md-2"><button class="btn btn-primary w-100" id="complete-sale">Complete sale</button></div></div>
+                    <?php if ($canManage): ?>
+                        <article class="panel mb-3">
+                            <div class="panel-heading"><div><h2>Global tax rate</h2><p>Applied automatically to new purchase orders and sales.</p></div></div>
+                            <?php if ($taxSettingsReady): ?>
+                                <form method="post" class="tax-setting-form"><?= csrf_field() ?><input type="hidden" name="action" value="tax_rate_update"><label class="form-label">Tax percentage<input class="form-control" name="tax_rate" type="number" min="0" max="100" step=".01" value="<?= number_format($taxRate, 2, '.', '') ?>" required></label><button class="btn btn-outline-primary">Save tax rate</button></form>
+                            <?php else: ?>
+                                <p class="text-warning mb-0">Apply <code>database/migrations/005_global_tax.sql</code> to enable the global tax setting.</p>
+                            <?php endif; ?>
+                        </article>
+                    <?php endif; ?>
+                    <?php if (role_allows($user, ['administrator', 'manager', 'cashier'])): ?><article class="panel mb-3"><div class="panel-heading"><div><h2>Point of sale</h2><p>Search products by name, SKU, barcode, model, or brand. Stock is revalidated at checkout.</p></div><span class="badge text-bg-light">Tax <?= number_format($taxRate, 2) ?>%</span></div>
+                    <?php if (!$taxSettingsReady): ?><div class="alert alert-warning small">Tax configuration is not installed yet. Ask an administrator to apply migration <code>005_global_tax.sql</code>.</div><?php endif; ?>
+                    <?php if (!$discountPercentageReady): ?><div class="alert alert-warning small">Percentage discounts are not installed yet. Ask an administrator to apply migration <code>006_sales_discount_percentage.sql</code>.</div><?php endif; ?>
+                    <form id="checkout-form" method="post" data-confirm="Complete this sale and deduct stock?"><?= csrf_field() ?><input type="hidden" name="action" value="sale_checkout"><?= request_key_field() ?><input type="hidden" name="cart" id="cart-json">
+                        <div class="row g-3 pos-layout">
+                            <div class="col-lg-5">
+                                <section class="pos-selector">
+                                    <label class="form-label" for="pos-product-search">Find an in-stock product</label>
+                                    <input id="pos-product-search" class="form-control" type="search" placeholder="Type a name, SKU, barcode…" autocomplete="off" aria-controls="pos-search-results" aria-expanded="false">
+                                    <div id="pos-search-results" class="pos-search-results" role="listbox" hidden></div>
+                                    <div id="pos-selected-product" class="pos-selected-product text-secondary mt-3">Select a search result to add it to the cart.</div>
+                                    <div class="row g-2 align-items-end mt-2"><div class="col-5"><label class="form-label">Quantity<input class="form-control" type="number" id="pos-quantity" min="1" step="1" value="1"></label></div><div class="col-7"><button type="button" class="btn btn-outline-primary w-100" id="add-to-cart">Add to cart</button></div></div>
+                                </section>
+                            </div>
+                            <div class="col-lg-7">
+                                <section class="pos-cart-panel"><div class="d-flex justify-content-between align-items-center"><h3 class="h6 mb-0">Current sale</h3><span class="small text-secondary" id="pos-cart-count">0 items</span></div>
+                                    <div class="table-responsive"><table class="table align-middle" id="cart-table"><thead><tr><th>Product</th><th>Qty</th><th>Price</th><th>Total</th><th></th></tr></thead><tbody><tr class="cart-empty"><td colspan="5" class="text-secondary">Your cart is empty.</td></tr></tbody></table></div>
+                                    <div class="pos-totals"><div><span>Subtotal</span><strong id="pos-subtotal">₱0.00</strong></div><div><span>Discount amount (<strong id="pos-discount-rate-preview">0%</strong>)</span><strong id="pos-discount-preview">−₱0.00</strong></div><div><span>Tax (<?= number_format($taxRate, 2) ?>%)</span><strong id="pos-tax-preview">₱0.00</strong></div><div class="pos-grand-total"><span>Estimated total</span><strong id="pos-total-preview">₱0.00</strong></div></div>
+                                </section>
+                            </div>
+                            <div class="col-12"><div class="row g-3 justify-content-end align-items-end"><div class="col-md-3"><label class="form-label" for="pos-discount-rate">Discount (%)</label><div class="input-group"><input class="form-control" name="discount_rate" id="pos-discount-rate" type="number" min="0" max="100" step=".01" value="0" aria-describedby="discount-rate-help"><span class="input-group-text">%</span></div><small class="form-text" id="discount-rate-help">Calculated amount is shown in pesos above.</small></div><div class="col-md-3"><label class="form-label">Payment<select name="payment_method" class="form-select"><option value="cash">Cash</option><option value="card">Card</option><option value="bank_transfer">Bank transfer</option><option value="other">Other</option></select></label></div><div class="col-md-3"><button class="btn btn-primary w-100" id="complete-sale" <?= (!$taxSettingsReady || !$discountPercentageReady) ? 'disabled title="Apply the required sales migrations first."' : '' ?>>Complete sale</button></div></div></div>
+                        </div>
                     </form></article><?php endif; ?>
-                    <article class="panel"><h2>Sales history</h2><div class="table-responsive"><table class="table"><thead><tr><th>Receipt</th><th>Cashier</th><th>Payment</th><th>Status</th><th>Date</th><th class="text-end">Total</th></tr></thead><tbody><?php foreach ($sales as $sale): ?><tr><td><a href="?page=receipt&id=<?= (int) $sale['sale_id'] ?>"><?= Security::e($sale['receipt_number']) ?></a></td><td><?= Security::e($sale['full_name']) ?></td><td><?= Security::e(ucwords(str_replace('_', ' ', $sale['payment_method']))) ?></td><td><?= Security::e($sale['status']) ?></td><td><?= Security::e(date('M j, Y H:i', strtotime($sale['created_at']))) ?></td><td class="text-end">₱<?= number_format((float) $sale['total'], 2) ?></td></tr><?php endforeach; ?></tbody></table></div></article>
+                    <article class="panel"><h2>Sales history</h2><div class="table-responsive"><table class="table"><thead><tr><th>Receipt</th><th>Cashier</th><th>Payment</th><th>Status</th><th>Date</th><th>Discount</th><th class="text-end">Total</th></tr></thead><tbody><?php foreach ($sales as $sale): ?><?php $saleDiscountRate = $discountPercentageReady ? (float) ($sale['discount_rate'] ?? 0) : 0.0; ?><tr><td><a href="?page=receipt&id=<?= (int) $sale['sale_id'] ?>"><?= Security::e($sale['receipt_number']) ?></a></td><td><?= Security::e($sale['full_name']) ?></td><td><?= Security::e(ucwords(str_replace('_', ' ', $sale['payment_method']))) ?></td><td><?= Security::e($sale['status']) ?></td><td><?= Security::e(date('M j, Y H:i', strtotime($sale['created_at']))) ?></td><td><?= format_currency($sale['discount']) ?><small class="d-block text-secondary"><?= $saleDiscountRate > 0 ? number_format($saleDiscountRate, 2) . '%' : ((float) $sale['discount'] > 0 ? 'Historical fixed discount' : 'No discount') ?></small></td><td class="text-end"><?= format_currency($sale['total']) ?></td></tr><?php endforeach; ?><?php if (!$sales): ?><tr><td colspan="7" class="text-secondary">No sales recorded.</td></tr><?php endif; ?></tbody></table></div></article>
 
                 <?php elseif ($page === 'receipt'):
                     $receiptId = filter_var($_GET['id'] ?? null, FILTER_VALIDATE_INT);
@@ -1181,7 +1658,7 @@ $nav = [
                     <article class="panel receipt-panel"><div class="receipt-head"><div class="receipt-brand">PartsDesk</div><div><h2>Receipt</h2><p><?= Security::e($receipt['receipt_number']) ?></p></div><button class="btn btn-outline-primary ms-auto" onclick="window.print()">Print receipt</button></div><hr>
                         <div class="row small text-secondary mb-3"><div class="col-6"><strong>Cashier:</strong> <?= Security::e($receipt['full_name']) ?></div><div class="col-6 text-end"><strong>Date:</strong> <?= Security::e(date('M j, Y H:i', strtotime($receipt['created_at']))) ?></div></div>
                         <div class="table-responsive"><table class="table"><thead><tr><th>Item</th><th>Qty</th><th>Unit price</th><th>Discount</th><th class="text-end">Line total</th></tr></thead><tbody><?php foreach ($receiptItems as $item): ?><tr><td><?= Security::e($item['product']) ?><small class="d-block text-secondary"><?= Security::e($item['sku']) ?></small></td><td><?= Security::e($item['quantity']) ?></td><td>₱<?= number_format((float) $item['unit_price'], 2) ?></td><td>₱<?= number_format((float) $item['discount'], 2) ?></td><td class="text-end">₱<?= number_format((float) $item['line_total'], 2) ?></td></tr><?php endforeach; ?></tbody></table></div>
-                        <div class="receipt-totals"><div><span>Subtotal</span><strong>₱<?= number_format((float) $receipt['subtotal'], 2) ?></strong></div><div><span>Discount</span><strong>−₱<?= number_format((float) $receipt['discount'], 2) ?></strong></div><div><span>Tax</span><strong>₱<?= number_format((float) $receipt['tax'], 2) ?></strong></div><div class="receipt-grand"><span>Total paid · <?= Security::e(ucwords(str_replace('_', ' ', $receipt['payment_method']))) ?></span><strong>₱<?= number_format((float) $receipt['total'], 2) ?></strong></div></div>
+                        <div class="receipt-totals"><div><span>Subtotal</span><strong>₱<?= number_format((float) $receipt['subtotal'], 2) ?></strong></div><div><span>Discount<?= $discountPercentageReady && (float) ($receipt['discount_rate'] ?? 0) > 0 ? ' (' . number_format((float) $receipt['discount_rate'], 2) . '%)' : ((float) $receipt['discount'] > 0 ? ' (historical fixed amount)' : '') ?></span><strong>−₱<?= number_format((float) $receipt['discount'], 2) ?></strong></div><div><span>Tax</span><strong>₱<?= number_format((float) $receipt['tax'], 2) ?></strong></div><div class="receipt-grand"><span>Total paid · <?= Security::e(ucwords(str_replace('_', ' ', $receipt['payment_method']))) ?></span><strong>₱<?= number_format((float) $receipt['total'], 2) ?></strong></div></div>
                         <a class="btn btn-outline-secondary mt-4" href="?page=sales">Back to sales</a>
                     </article>
 
@@ -1274,8 +1751,9 @@ $nav = [
                          GROUP BY created_at::date ORDER BY day",
                         ['start' => $startDate, 'end' => $endDate]
                     );
+                    $discountRateColumn = $discountPercentageReady ? 's.discount_rate' : 'NULL::numeric AS discount_rate';
                     $profitRows = rows($db,
-                        "SELECT s.sale_id, s.receipt_number, s.created_at, s.total, s.discount,
+                        "SELECT s.sale_id, s.receipt_number, s.created_at, s.total, s.discount, " . $discountRateColumn . ",
                                 COALESCE(sum(si.line_total),0) AS line_revenue,
                                 COALESCE(sum(si.quantity * si.unit_cost),0) AS cost
                          FROM sales s LEFT JOIN sale_items si USING (sale_id)
@@ -1330,10 +1808,10 @@ $nav = [
                     $exportData = [
                         'sales' => [
                             'sales-report.csv',
-                            ['Receipt', 'Date', 'Receipt total', 'Discount', 'Net merchandise revenue', 'Cost basis'],
+                            ['Receipt', 'Date', 'Receipt total', 'Discount rate (%)', 'Discount amount', 'Net merchandise revenue', 'Cost basis'],
                             array_map(static fn(array $record): array => [
                                 $record['receipt_number'], $record['created_at'], $record['total'],
-                                $record['discount'], $record['line_revenue'], $record['cost'],
+                                $record['discount_rate'], $record['discount'], $record['line_revenue'], $record['cost'],
                             ], $profitRows),
                         ],
                         'daily' => [
@@ -1405,15 +1883,90 @@ $nav = [
 
                 <?php elseif ($page === 'users'):
                     $usersMigrationReady = user_management_migration_applied($db);
+                    $profileExtensionsReady = user_profile_extensions_applied($db);
+                    $profileManagementReady = $usersMigrationReady && $profileExtensionsReady;
+                    $profileColumns = $profileManagementReady
+                        ? 'gender, hire_date, emergency_contact_name, emergency_contact_phone'
+                        : 'NULL AS gender, NULL AS hire_date, NULL AS emergency_contact_name, NULL AS emergency_contact_phone';
                     $profiles = rows($db, $usersMigrationReady
-                        ? 'SELECT user_id, full_name, email, address, birth_date, phone, role, is_active, deleted_at, CASE WHEN is_active THEN 1 ELSE 0 END AS active_int, created_at FROM app_profiles ORDER BY full_name'
-                        : 'SELECT user_id, full_name, NULL AS email, NULL AS address, NULL AS birth_date, NULL AS phone, role, is_active, NULL AS deleted_at, CASE WHEN is_active THEN 1 ELSE 0 END AS active_int, created_at FROM app_profiles ORDER BY full_name');
+                        ? 'SELECT user_id, full_name, email, address, birth_date, phone, ' . $profileColumns . ', role, is_active, deleted_at, CASE WHEN is_active THEN 1 ELSE 0 END AS active_int, created_at FROM app_profiles ORDER BY full_name'
+                        : 'SELECT user_id, full_name, NULL AS email, NULL AS address, NULL AS birth_date, NULL AS phone, ' . $profileColumns . ', role, is_active, NULL AS deleted_at, CASE WHEN is_active THEN 1 ELSE 0 END AS active_int, created_at FROM app_profiles ORDER BY full_name');
                     $managedAuthReady = (string) getenv('SUPABASE_SERVICE_ROLE_KEY') !== '';
                 ?>
-                    <?php if (!$usersMigrationReady): ?><div class="alert alert-danger"><strong>User management schema is not installed.</strong> Run <code>database/migrations/003_user_management.sql</code> in the Supabase SQL Editor, then reload this page. Existing users are shown below; account editing stays disabled until the migration is applied.</div><?php endif; ?>
-                    <?php if (!$managedAuthReady): ?><div class="alert alert-warning">Account creation and editing require the server-only <code>SUPABASE_SERVICE_ROLE_KEY</code>. Add it to the protected <code>.env</code> file before managing accounts.</div><?php endif; ?>
-                    <?php if ($usersMigrationReady): ?><article class="panel mb-3"><div class="panel-heading"><div><h2>Create a user account</h2><p>Set the user's contact details, sign-in email, initial password, and access role.</p></div></div><form method="post" class="row g-3"><?= csrf_field() ?><input type="hidden" name="action" value="profile_create"><div class="col-md-4"><label class="form-label">Full name<input class="form-control" name="full_name" maxlength="150" autocomplete="name" required></label></div><div class="col-md-4"><label class="form-label">Email<input class="form-control" name="email" type="email" maxlength="254" autocomplete="email" required></label></div><div class="col-md-4"><label class="form-label">Initial password<input class="form-control" name="password" type="password" minlength="12" maxlength="72" autocomplete="new-password" required><small class="text-secondary">At least 12 characters.</small></label></div><div class="col-md-3"><label class="form-label">Role<select class="form-select" name="role" required><?php foreach ($roleLabels as $key => $label): ?><option value="<?= Security::e($key) ?>" <?= $key === 'cashier' ? 'selected' : '' ?>><?= Security::e($label) ?></option><?php endforeach; ?></select></label></div><div class="col-md-3"><label class="form-label">Phone<input class="form-control" name="phone" maxlength="40" autocomplete="tel"></label></div><div class="col-md-3"><label class="form-label">Birthdate<input class="form-control" name="birth_date" type="date" max="<?= date('Y-m-d') ?>"></label></div><div class="col-md-3"><label class="form-label">Address<input class="form-control" name="address" maxlength="500" autocomplete="street-address"></label></div><div class="col-12"><button class="btn btn-primary" <?= $managedAuthReady ? '' : 'disabled' ?>>Create account</button></div></form></article><?php endif; ?>
-                    <article class="panel"><div class="panel-heading"><div><h2>Users</h2><p>Update account details and access. Deleted users lose access; their transaction and audit history is retained.</p></div><span class="badge text-bg-light"><?= count($profiles) ?> accounts</span></div><div class="table-responsive"><table class="table align-middle"><thead><tr><th>User</th><th>Contact and profile</th><th>Role</th><th>Status</th><th>Manage account</th></tr></thead><tbody><?php foreach ($profiles as $profile): ?><tr><td><strong><?= Security::e($profile['full_name']) ?></strong><small class="d-block text-secondary"><?= Security::e($profile['user_id']) ?></small></td><td><?= Security::e($profile['email'] ?? 'Email not on file') ?><small class="d-block text-secondary"><?= Security::e($profile['phone'] ?: 'No phone') ?> · <?= Security::e($profile['birth_date'] ?: 'No birthdate') ?></small><small class="d-block text-secondary"><?= Security::e($profile['address'] ?: 'No address') ?></small></td><td><?= Security::e($roleLabels[$profile['role']] ?? $profile['role']) ?></td><td><?php if ($profile['deleted_at'] !== null): ?><span class="badge text-bg-dark">Deleted</span><?php elseif ($profile['active_int']): ?><span class="badge text-bg-success">Active</span><?php else: ?><span class="badge text-bg-secondary">Inactive</span><?php endif; ?></td><td><?php if ($usersMigrationReady && $profile['deleted_at'] === null): ?><?php if ($managedAuthReady): ?><details class="user-edit"><summary class="btn btn-sm btn-outline-primary">Edit</summary><form method="post" class="user-edit-form"><?= csrf_field() ?><input type="hidden" name="action" value="profile_update"><input type="hidden" name="user_id" value="<?= Security::e($profile['user_id']) ?>"><label class="form-label">Full name<input class="form-control" name="full_name" maxlength="150" value="<?= Security::e($profile['full_name']) ?>" required></label><label class="form-label">Email<input class="form-control" name="email" type="email" maxlength="254" value="<?= Security::e($profile['email'] ?? '') ?>" required></label><label class="form-label">Role<select class="form-select" name="role"><?php foreach ($roleLabels as $key => $label): ?><option value="<?= Security::e($key) ?>" <?= $profile['role'] === $key ? 'selected' : '' ?>><?= Security::e($label) ?></option><?php endforeach; ?></select></label><label class="form-label">Phone<input class="form-control" name="phone" maxlength="40" value="<?= Security::e($profile['phone'] ?? '') ?>"></label><label class="form-label">Birthdate<input class="form-control" name="birth_date" type="date" max="<?= date('Y-m-d') ?>" value="<?= Security::e($profile['birth_date'] ?? '') ?>"></label><label class="form-label">Address<input class="form-control" name="address" maxlength="500" value="<?= Security::e($profile['address'] ?? '') ?>"></label><label class="form-label">New password <small class="text-secondary">(leave blank to keep current)</small><input class="form-control" name="password" type="password" minlength="12" maxlength="72" autocomplete="new-password"></label><button class="btn btn-primary">Save changes</button></form></details><?php else: ?><span class="text-secondary">Add the service-role key to edit</span><?php endif; ?><div class="d-flex gap-2 mt-2"><form method="post"><?= csrf_field() ?><input type="hidden" name="action" value="profile_active"><input type="hidden" name="user_id" value="<?= Security::e($profile['user_id']) ?>"><input type="hidden" name="is_active" value="<?= $profile['active_int'] ? '0' : '1' ?>"><button class="btn btn-sm btn-outline-secondary" <?= $profile['user_id'] === $user['id'] ? 'disabled' : '' ?>><?= $profile['active_int'] ? 'Deactivate' : 'Activate' ?></button></form><form method="post" data-confirm="Delete this user? PartsDesk will remove the Auth account when possible; if records require it, access will be disabled and history preserved."><?= csrf_field() ?><input type="hidden" name="action" value="profile_delete"><input type="hidden" name="user_id" value="<?= Security::e($profile['user_id']) ?>"><button class="btn btn-sm btn-outline-danger" <?= $profile['user_id'] === $user['id'] ? 'disabled' : '' ?>>Delete</button></form></div><?php else: ?><span class="text-secondary">Migration required</span><?php endif; ?></td></tr><?php endforeach; ?><?php if (!$profiles): ?><tr><td colspan="5" class="text-secondary">No user accounts have been created.</td></tr><?php endif; ?></tbody></table></div></article>
+                    <?php if (!$usersMigrationReady): ?><div class="alert alert-warning small">User management schema is not installed. Apply <code>003_user_management.sql</code> first.</div><?php endif; ?>
+                    <?php if ($usersMigrationReady && !$profileExtensionsReady): ?><div class="alert alert-warning small">The merged user profile fields are not installed. Apply <code>004_user_profile_extensions.sql</code> to enable account creation and editing.</div><?php endif; ?>
+                    <?php if (!$managedAuthReady): ?><div class="alert alert-warning small">Account creation and editing require the server-only <code>SUPABASE_SERVICE_ROLE_KEY</code>.</div><?php endif; ?>
+                    <div class="row g-3 user-layout">
+                        <?php if ($profileManagementReady): ?>
+                            <div class="col-xl-4">
+                                <article class="panel h-100">
+                                    <div class="panel-heading"><div><h2>Create a user account</h2><p>Enter account details in order.</p></div></div>
+                                    <form method="post" class="vstack gap-3 user-create-form"><?= csrf_field() ?><input type="hidden" name="action" value="profile_create">
+                                        <label class="form-label">Full name<input class="form-control mt-1" name="full_name" maxlength="150" autocomplete="name" required></label>
+                                        <label class="form-label">Email<input class="form-control mt-1" name="email" type="email" maxlength="254" autocomplete="email" required></label>
+                                        <label class="form-label">Initial password<input class="form-control mt-1" name="password" type="password" minlength="12" maxlength="72" autocomplete="new-password" required><small class="text-secondary">At least 12 characters.</small></label>
+                                        <label class="form-label">Role<select class="form-select mt-1" name="role" required><?php foreach ($roleLabels as $key => $label): ?><option value="<?= Security::e($key) ?>" <?= $key === 'cashier' ? 'selected' : '' ?>><?= Security::e($label) ?></option><?php endforeach; ?></select></label>
+                                        <label class="form-label">Phone<input class="form-control mt-1" name="phone" maxlength="40" autocomplete="tel"></label>
+                                        <label class="form-label">Birthdate<input class="form-control mt-1" name="birth_date" type="date" max="<?= date('Y-m-d') ?>"></label>
+                                        <label class="form-label">Gender<select class="form-select mt-1" name="gender"><option value="">Prefer not to say</option><option value="female">Female</option><option value="male">Male</option><option value="other">Other</option></select></label>
+                                        <label class="form-label">Hire date<input class="form-control mt-1" name="hire_date" type="date" max="<?= date('Y-m-d') ?>"></label>
+                                        <label class="form-label">Address<input class="form-control mt-1" name="address" maxlength="500" autocomplete="street-address"></label>
+                                        <label class="form-label">Emergency contact<input class="form-control mt-1" name="emergency_contact_name" maxlength="150" placeholder="Contact name"></label>
+                                        <label class="form-label">Emergency contact phone<input class="form-control mt-1" name="emergency_contact_phone" maxlength="40" type="tel"></label>
+                                        <button class="btn btn-primary" <?= $managedAuthReady ? '' : 'disabled' ?>>Create account</button>
+                                    </form>
+                                </article>
+                            </div>
+                        <?php endif; ?>
+                        <div class="col-xl-8">
+                            <article class="panel">
+                                <div class="panel-heading"><div><h2>Users and account controls</h2><p>Manage access on this panel. Historical transactions remain attached to retained accounts.</p></div><span class="badge text-bg-light"><?= count($profiles) ?> accounts</span></div>
+                                <div class="table-responsive"><table class="table align-middle"><thead><tr><th>User</th><th>Contact / profile</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+                                    <?php foreach ($profiles as $profile): ?>
+                                        <tr>
+                                            <td><strong><?= Security::e($profile['full_name']) ?></strong><small class="d-block text-secondary"><?= Security::e($profile['user_id']) ?></small></td>
+                                            <td><?= Security::e($profile['email'] ?? 'Email not on file') ?><small class="d-block text-secondary"><?= Security::e($profile['phone'] ?: 'No phone') ?> · <?= Security::e($profile['birth_date'] ?: 'No birthdate') ?></small><small class="d-block text-secondary"><?= Security::e($profile['address'] ?: 'No address') ?></small></td>
+                                            <td><?= Security::e($roleLabels[$profile['role']] ?? $profile['role']) ?></td>
+                                            <td><?php if ($profile['deleted_at'] !== null): ?><span class="badge text-bg-dark">Deleted</span><?php elseif ($profile['active_int']): ?><span class="badge text-bg-success">Active</span><?php else: ?><span class="badge text-bg-secondary">Inactive</span><?php endif; ?></td>
+                                            <td>
+                                                <?php if ($profileManagementReady && $profile['deleted_at'] === null): ?>
+                                                    <div class="d-flex flex-wrap gap-1">
+                                                        <?php if ($managedAuthReady): ?><button type="button" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#userEditModal" data-user="<?= Security::e(json_encode($profile, JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_TAG | JSON_HEX_AMP)) ?>">Edit</button><?php endif; ?>
+                                                        <form method="post"><?= csrf_field() ?><input type="hidden" name="action" value="profile_active"><input type="hidden" name="user_id" value="<?= Security::e($profile['user_id']) ?>"><input type="hidden" name="is_active" value="<?= $profile['active_int'] ? '0' : '1' ?>"><button class="btn btn-sm btn-outline-secondary" <?= $profile['user_id'] === $user['id'] ? 'disabled' : '' ?>><?= $profile['active_int'] ? 'Deactivate' : 'Activate' ?></button></form>
+                                                        <form method="post" data-confirm="Delete this user? If records depend on the account, access will be disabled and transaction history kept."><?= csrf_field() ?><input type="hidden" name="action" value="profile_delete"><input type="hidden" name="user_id" value="<?= Security::e($profile['user_id']) ?>"><button class="btn btn-sm btn-outline-danger" <?= $profile['user_id'] === $user['id'] ? 'disabled' : '' ?>>Delete</button></form>
+                                                    </div>
+                                                <?php else: ?><span class="text-secondary"><?= $profile['deleted_at'] !== null ? 'Deleted' : 'Migration required' ?></span><?php endif; ?>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                    <?php if (!$profiles): ?><tr><td colspan="5" class="text-secondary">No user accounts have been created.</td></tr><?php endif; ?>
+                                </tbody></table></div>
+                            </article>
+                        </div>
+                    </div>
+                    <?php if ($profileManagementReady && $managedAuthReady): ?>
+                        <div class="modal fade" id="userEditModal" tabindex="-1" aria-labelledby="userEditModalTitle" aria-hidden="true">
+                            <div class="modal-dialog modal-lg modal-dialog-scrollable"><div class="modal-content">
+                                <form method="post"><?= csrf_field() ?><input type="hidden" name="action" value="profile_update"><input type="hidden" name="user_id">
+                                    <div class="modal-header"><h2 class="modal-title fs-5" id="userEditModalTitle">Edit account</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                                    <div class="modal-body"><div class="row g-3">
+                                        <div class="col-md-6"><label class="form-label">Full name<input class="form-control" name="full_name" maxlength="150" required></label></div>
+                                        <div class="col-md-6"><label class="form-label">Email<input class="form-control" name="email" type="email" maxlength="254" required></label></div>
+                                        <div class="col-md-6"><label class="form-label">Role<select class="form-select" name="role" required><?php foreach ($roleLabels as $key => $label): ?><option value="<?= Security::e($key) ?>"><?= Security::e($label) ?></option><?php endforeach; ?></select></label></div>
+                                        <div class="col-md-6"><label class="form-label">Phone<input class="form-control" name="phone" maxlength="40"></label></div>
+                                        <div class="col-md-6"><label class="form-label">Birthdate<input class="form-control" name="birth_date" type="date" max="<?= date('Y-m-d') ?>"></label></div>
+                                        <div class="col-md-6"><label class="form-label">Gender<select class="form-select" name="gender"><option value="">Prefer not to say</option><option value="female">Female</option><option value="male">Male</option><option value="other">Other</option></select></label></div>
+                                        <div class="col-md-6"><label class="form-label">Hire date<input class="form-control" name="hire_date" type="date" max="<?= date('Y-m-d') ?>"></label></div>
+                                        <div class="col-md-6"><label class="form-label">Address<input class="form-control" name="address" maxlength="500"></label></div>
+                                        <div class="col-md-6"><label class="form-label">Emergency contact<input class="form-control" name="emergency_contact_name" maxlength="150"></label></div>
+                                        <div class="col-md-6"><label class="form-label">Emergency contact phone<input class="form-control" name="emergency_contact_phone" maxlength="40" type="tel"></label></div>
+                                        <div class="col-12"><label class="form-label">New password <small class="text-secondary">(leave blank to keep current)</small><input class="form-control" name="password" type="password" minlength="12" maxlength="72" autocomplete="new-password"></label></div>
+                                    </div></div>
+                                    <div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary">Save changes</button></div>
+                                </form>
+                            </div></div>
+                        </div>
+                    <?php endif; ?>
 
                 <?php else: ?>
                     <article class="panel"><h2>Page not found</h2><p>Choose an item from the navigation.</p><a class="btn btn-primary" href="?page=dashboard">Go to dashboard</a></article>
@@ -1423,7 +1976,36 @@ $nav = [
         </main>
     </div>
 <?php endif; ?>
+<div class="toast-container position-fixed top-0 end-0 p-3 app-toast-container" id="app-toast-container" aria-live="polite" aria-atomic="true">
+    <?php foreach ([
+        ['message' => $authNotice, 'type' => 'warning'],
+        ['message' => $error, 'type' => 'danger'],
+        ['message' => $notice, 'type' => 'success'],
+    ] as $toast): ?>
+        <?php if ($toast['message'] !== ''): ?>
+            <div class="toast app-toast text-bg-<?= Security::e($toast['type']) ?>" role="<?= $toast['type'] === 'danger' ? 'alert' : 'status' ?>" data-bs-delay="6500">
+                <div class="d-flex"><div class="toast-body"><?= Security::e($toast['message']) ?></div><button type="button" class="btn-close <?= $toast['type'] === 'warning' || $toast['type'] === 'danger' ? 'btn-close-white' : '' ?> me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button></div>
+            </div>
+        <?php endif; ?>
+    <?php endforeach; ?>
+</div>
+<div class="modal fade" id="confirmActionModal" tabindex="-1" aria-labelledby="confirmActionTitle" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered"><div class="modal-content">
+        <div class="modal-header"><h2 class="modal-title fs-5" id="confirmActionTitle">Confirm action</h2><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+        <div class="modal-body" id="confirmActionMessage">Please confirm this action.</div>
+        <div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button type="button" class="btn btn-primary" id="confirmActionContinue">Continue</button></div>
+    </div></div>
+</div>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+window.posCatalog = <?= json_encode(
+    $page === 'sales' && isset($products) ? $products : [],
+    JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_THROW_ON_ERROR
+) ?>;
+window.posTaxRate = <?= isset($taxRate) ? json_encode($taxRate, JSON_THROW_ON_ERROR) : '0' ?>;
+window.serverHasError = <?= $error !== '' ? 'true' : 'false' ?>;
+window.serverFailedAction = <?= json_encode($_SERVER['REQUEST_METHOD'] === 'POST' && $error !== '' ? (string) ($_POST['action'] ?? '') : '', JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_THROW_ON_ERROR) ?>;
+</script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <script src="assets/app.js"></script>
 </body>

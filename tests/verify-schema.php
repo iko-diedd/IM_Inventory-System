@@ -19,6 +19,7 @@ try {
         'app_profiles', 'categories', 'brands', 'suppliers', 'products', 'supplier_products',
         'purchases', 'purchase_items', 'purchase_receipts', 'purchase_receipt_items', 'sales',
         'sale_items', 'returns', 'return_items', 'inventory_movements', 'audit_logs', 'warranty_claims',
+        'app_settings', 'app_notification_reads',
     ];
     $failures = [];
 
@@ -45,6 +46,13 @@ try {
     if (!in_array($usersMigration, [true, 't', '1'], true)) {
         $failures[] = 'migration 003_user_management is not recorded';
     }
+    foreach (['004_user_profile_extensions', '005_global_tax', '006_sales_discount_percentage', '007_notification_reads'] as $version) {
+        $applied = $db->prepare('SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = :version)');
+        $applied->execute(['version' => $version]);
+        if (!in_array($applied->fetchColumn(), [true, 't', '1'], true)) {
+            $failures[] = 'migration ' . $version . ' is not recorded';
+        }
+    }
     $profileColumns = $db->query(
         "SELECT count(*) FROM information_schema.columns
          WHERE table_schema = 'public' AND table_name = 'app_profiles'
@@ -52,6 +60,40 @@ try {
     )->fetchColumn();
     if ((int) $profileColumns !== 5) {
         $failures[] = 'user contact/profile fields are missing';
+    }
+    $extendedProfileColumns = $db->query(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'app_profiles'
+           AND column_name IN ('gender', 'hire_date', 'emergency_contact_name', 'emergency_contact_phone')"
+    )->fetchColumn();
+    if ((int) $extendedProfileColumns !== 4) {
+        $failures[] = 'extended user profile fields are missing';
+    }
+    $purchaseTaxColumn = $db->query(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'purchases' AND column_name = 'tax_amount')"
+    )->fetchColumn();
+    if (!in_array($purchaseTaxColumn, [true, 't', '1'], true)) {
+        $failures[] = 'purchase tax snapshot is missing';
+    }
+    $discountRateColumn = $db->query(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'sales' AND column_name = 'discount_rate')"
+    )->fetchColumn();
+    if (!in_array($discountRateColumn, [true, 't', '1'], true)) {
+        $failures[] = 'sales discount percentage snapshot is missing';
+    }
+    $settingsColumn = $db->query(
+        "SELECT has_table_privilege('authenticated', 'public.app_settings', 'SELECT')"
+    )->fetchColumn();
+    if (in_array($settingsColumn, [true, 't', '1'], true)) {
+        $failures[] = 'global application settings are exposed to the Supabase authenticated Data API role';
+    }
+    $notificationReadTable = $db->query(
+        "SELECT has_table_privilege('authenticated', 'public.app_notification_reads', 'SELECT')"
+    )->fetchColumn();
+    if (in_array($notificationReadTable, [true, 't', '1'], true)) {
+        $failures[] = 'per-user notification read state is exposed to the Supabase authenticated Data API role';
     }
     $warrantySnapshot = $db->query(
         "SELECT EXISTS (SELECT 1 FROM information_schema.columns
@@ -100,8 +142,10 @@ try {
     }
 
     printf("PASS %d application tables have RLS enabled.\n", count($requiredTables));
-    echo "PASS core, warranty, and user-management migrations and trusted backend role membership.\n";
-    echo "PASS administrator user profile fields are available.\n";
+    echo "PASS core, warranty, user-management, profile-extension, tax, percentage-discount, and notification-read migrations and trusted backend role membership.\n";
+    echo "PASS administrator user profile fields, purchase tax snapshots, and sale discount percentages are available.\n";
+    echo "PASS global application settings are not granted to Data API authenticated users.\n";
+    echo "PASS per-user notification read state is not granted to Data API authenticated users.\n";
     echo "PASS product average_cost is not granted to Data API authenticated users.\n";
     echo "PASS historical sale cost is not granted to Data API authenticated users.\n";
     echo "PASS sold warranty durations are snapshotted for claim eligibility.\n";
